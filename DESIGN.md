@@ -9,15 +9,53 @@ A shared orchestration platform that lets internal teams expose their services a
 ## Platform Architecture
 
 ```
-Platform Orchestration Service (ECS)
+Platform Infrastructure (platform team owned)
+├── Temporal cluster           — platform primitive, like ECS or RDS
+│   ├── namespace: platform    — platform/onboarding workflows
+│   ├── namespace: orch-app    — orchestration app internal workflows
+│   ├── namespace: team-*      — one per team, provisioned on onboarding
+│   └── ...
+└── Temporal host injected into every ECS service as TEMPORAL_HOST
+
+Platform Orchestration Service (ECS, orchestration team owned)
 ├── API layer              — trigger workflows, query status, handle signals
 ├── Service catalog UI     — self-service portal, dynamic forms, approval inbox
-├── Workflow engine        — Temporal cluster (internal to orchestration service)
 ├── Primitive library      — reusable activities (approval, ITSM, email, HTTP)
-└── Service registry       — registered team endpoints + auth config
+├── Service registry       — registered team endpoints + auth config
+└── Workers
+    ├── orch-app namespace     — orchestration app's own internal workflows
+    └── team-* namespaces      — WaaS workflows requested via the service catalog
+                                 (dynamically served; teams don't need their own workers)
+
+Team ECS Service (optional worker)
+└── team-* namespace       — team's own internal workflows, if they choose to run them
 ```
 
-The Temporal cluster is an implementation detail of the orchestration service — teams interact with the orchestration API and UI, not Temporal directly. Other platform services that need orchestration on day 2 will connect to this same service.
+**Temporal is a platform primitive** — owned and operated by the platform team alongside ECS and URL namespace provisioning. The orchestration app connects to it the same way any other team would, with no special treatment.
+
+---
+
+## Worker Ownership Model
+
+This is the key design decision that shapes everything else:
+
+| Workflow type | Namespace | Worker |
+|---|---|---|
+| Platform onboarding/offboarding | `platform` | Platform team worker |
+| Orchestration app internal workflows | `orch-app` | Orchestration app worker |
+| WaaS workflow requested via service catalog | `team-{name}` | Orchestration app worker (dynamic) |
+| Team's own internal workflows | `team-{name}` | Team's own worker (optional) |
+
+**WaaS workflows run in the requesting team's namespace but are executed by the orchestration app's worker.** This means:
+- Teams get isolated history and visibility without needing to run workers
+- The orchestration app's worker dynamically connects to each team namespace as WaaS workflows are registered
+- Teams that want their own internal orchestration can run their own worker in their namespace alongside the orchestration worker — task queue naming prevents collision
+
+```
+namespace: team-data-eng
+├── task queue: waas              ← orchestration app's worker listens here
+└── task queue: data-eng-internal ← team's own worker listens here (optional)
+```
 
 ---
 
@@ -30,15 +68,7 @@ Each team gets a dedicated Temporal namespace. This provides:
 - Separate visibility in the UI
 - No cross-team data leakage
 
-```
-Temporal cluster (internal)
-├── namespace: platform          — onboarding/offboarding workflows
-├── namespace: team-data-eng
-├── namespace: team-payments
-└── namespace: team-security
-```
-
-The orchestration service runs a single worker process that dynamically serves all active namespaces. Namespaces are created on team onboarding and deprecated on offboarding.
+Namespaces are created on team onboarding and deprecated on offboarding.
 
 ---
 
@@ -224,8 +254,8 @@ When the orchestration service calls a team's registered endpoint:
 ### 5. Workflow versioning
 When a team updates a workflow definition, in-flight executions should complete on the version they started with. The definition layer needs versioning independent of Temporal's internal versioning.
 
-### 6. Day-2 orchestration for other services
-Teams that need their own orchestration (not the WaaS model) can run a Temporal worker in their ECS service and connect to the platform cluster in their namespace. The platform provides the cluster endpoint and namespace — teams bring the code.
+### 6. Team-owned workers
+Teams that need internal orchestration beyond what WaaS provides can run a Temporal worker in their ECS service. They connect to the platform cluster using their injected `TEMPORAL_HOST` and `TEMPORAL_NAMESPACE`, choose a task queue name that doesn't conflict with `waas`, and own their workflow/activity code entirely. The platform provides the namespace — teams bring the code.
 
 ---
 
