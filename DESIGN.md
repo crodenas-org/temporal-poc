@@ -83,10 +83,59 @@ Namespace lifecycle is automated via platform workflows running in the `platform
 4. Register team in the service catalog
 
 **Offboarding**:
-1. Drain or terminate in-flight workflows (configurable grace period)
-2. Delete schedules
-3. Deprecate namespace (data expires per retention policy)
-4. Remove from service catalog
+1. Pre-check: identify all workflows owned by this team — block offboarding until each is reassigned or deprecated
+2. Drain or terminate in-flight workflows (configurable grace period)
+3. Delete schedules
+4. Deprecate namespace (data expires per retention policy)
+5. Remove from service catalog
+
+---
+
+## Orchestration App: Managed Service Model
+
+The orchestration app is a **managed service**, not a generic workflow runner. This distinction matters:
+
+- The orchestration team owns the worker, the primitives, and the credentials (ITSM, email, Slack, etc.)
+- Teams are consumers of the service — they define *what* to orchestrate, not *how* to execute it
+- The orchestration app's SLA, scaling, and deployment windows are the orchestration team's responsibility to manage
+- Worker capacity, noisy neighbor mitigation, and deployment impact on in-flight workflows are orchestration team concerns — teams accept this as part of the service contract
+
+This means teams cannot inject arbitrary code into WaaS workflows. They compose from the platform primitive library only.
+
+---
+
+## Workflow Ownership
+
+Every workflow published to the service catalog must declare an owner. Ownership is a **publish-time requirement** — a workflow without a valid owner cannot be activated.
+
+```yaml
+ownership:
+  team: data-engineering
+  contact: data-eng@company.com
+  assignment_group: "DL-Data-Engineering"   # ServiceNow group, validated at publish
+  escalation_contact: jane.doe@company.com
+  review_date: 2027-01-01                   # workflow suspended and owner notified when passed
+```
+
+### What ownership enables
+
+- **Failure routing** — INC created on failure is auto-assigned to `assignment_group`, not a generic queue
+- **Failure notifications** — `contact` and `escalation_contact` are notified on failure or SLA breach
+- **Catalog governance** — only workflows with validated owners are visible in the catalog
+- **Revalidation** — when `review_date` passes, the workflow is suspended and the owner is notified to revalidate or deprecate
+- **Audit trail** — every execution record is tied to an owning team
+- **Offboarding safety** — when a team is offboarded, any workflows they own must be reassigned or deprecated before the namespace is torn down
+
+### Enforcement
+
+| Rule | Enforced at |
+|---|---|
+| `ownership` block required | Schema validation on publish |
+| `assignment_group` must exist in ServiceNow | ServiceNow API call at publish time |
+| `contact` must be a valid directory user or group | Directory lookup at publish time |
+| Workflow cannot be triggered without a valid owner | Runtime check on trigger |
+| `review_date` expired → workflow suspended | Scheduled background job; owner notified |
+| Team offboarding blocked until owned workflows are resolved | Offboarding workflow pre-check |
 
 ---
 
@@ -99,6 +148,13 @@ name: provision-database
 namespace: team-data-eng
 version: 1
 description: "Provision a managed database instance"
+
+ownership:
+  team: data-engineering
+  contact: data-eng@company.com
+  assignment_group: "DL-Data-Engineering"
+  escalation_contact: jane.doe@company.com
+  review_date: 2027-01-01
 
 inputs:
   - id: environment
