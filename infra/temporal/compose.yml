@@ -1,13 +1,13 @@
-name: temporal-poc
+name: temporal-dev
 
 services:
   postgresql:
-    image: docker.io/postgres:16
+    image: docker.io/postgres:18
     environment:
       POSTGRES_PASSWORD: temporal
       POSTGRES_USER: temporal
     volumes:
-      - postgresql_data:/var/lib/postgresql/data
+      - postgresql_data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U temporal"]
       interval: 5s

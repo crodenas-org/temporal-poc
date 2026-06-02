@@ -1,9 +1,13 @@
+"""
+Run the example order workflow worker.
+
+    TEMPORAL_HOST=localhost:7233 TEMPORAL_NAMESPACE=default uv run python -m temporal_client.examples.worker
+"""
 import asyncio
 import logging
-from temporalio.client import Client
-from temporalio.worker import Worker
-from activities import charge_payment, fulfill_order, release_inventory, reserve_inventory
-from workflows import OrderWorkflow
+from temporal_client import get_client, build_worker
+from .activities import charge_payment, fulfill_order, release_inventory, reserve_inventory
+from .workflows import OrderWorkflow
 
 TASK_QUEUE = "order-queue"
 
@@ -13,14 +17,14 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    client = await Client.connect("localhost:7233")
-    worker = Worker(
+    client = await get_client()
+    worker = build_worker(
         client,
         task_queue=TASK_QUEUE,
         workflows=[OrderWorkflow],
         activities=[reserve_inventory, release_inventory, charge_payment, fulfill_order],
     )
-    print(f"Worker running on task queue: {TASK_QUEUE}")
+    print(f"Worker running — namespace: {client.namespace}  task queue: {TASK_QUEUE}")
     print("Press Ctrl+C to stop.")
     await worker.run()
 
