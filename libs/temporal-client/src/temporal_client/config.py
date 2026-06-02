@@ -18,3 +18,15 @@ def temporal_host() -> str:
 
 def temporal_namespace() -> str:
     return _require("TEMPORAL_NAMESPACE")
+
+
+def tls_cert_path() -> str | None:
+    return os.environ.get("TEMPORAL_TLS_CERT")
+
+
+def tls_key_path() -> str | None:
+    return os.environ.get("TEMPORAL_TLS_KEY")
+
+
+def tls_ca_path() -> str | None:
+    return os.environ.get("TEMPORAL_TLS_CA")
