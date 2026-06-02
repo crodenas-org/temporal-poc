@@ -1,45 +1,62 @@
 # Temporal — Local Dev
 
-## Start
+> Full setup and usage docs are in the [root README](../../README.md). This file covers quick-reference commands for when you're already set up.
+
+## Prerequisites (first time only)
 
 ```bash
-cd infra/temporal
-podman compose up -d
+brew install step        # cert generation
+brew install podman      # containers
+pip install podman-compose
 ```
 
-- gRPC: `localhost:7233`
-- UI: `http://localhost:8080`
-
-## Stop / reset
+## First-time setup
 
 ```bash
-podman compose down          # stop, keep data
-podman compose down -v       # stop and wipe postgres volume
+make certs    # generate CA + server + dev-client certs
+make up       # start stack (~30s for auto-setup to finish)
+make ps       # verify all three containers are healthy
 ```
 
-## Service environment variables
+## Daily commands
 
-Copy `.env.example` to your service's `.env` and set:
+```bash
+make up       # start
+make down     # stop, keep data
+make reset    # stop and wipe postgres volume
+make logs     # follow logs
+make ps       # container status
+make ui       # open http://localhost:8080
+```
+
+## Smoke test
+
+```bash
+make example-worker                          # terminal 1
+make example-start                           # terminal 2 — copy the workflow ID
+make example-approve ID=order-ORD-XXXXXXXX
+make example-result  ID=order-ORD-XXXXXXXX
+```
+
+## Namespace management
+
+```bash
+# Create a namespace for a new service
+podman exec temporal-dev_temporal_1 \
+  temporal operator namespace create svc-orders --address temporal:7233
+
+# Issue a client cert for it
+make issue-cert SVC=svc-orders
+```
+
+## Service env vars
+
+Copy `.env.example` to your service `.env`:
 
 ```
 TEMPORAL_HOST=localhost:7233
-TEMPORAL_NAMESPACE=default   # use your provisioned namespace in non-local envs
-```
-
-## Validate with the example worker
-
-From the `libs/temporal-client` directory:
-
-```bash
-# Terminal 1 — worker
-TEMPORAL_HOST=localhost:7233 TEMPORAL_NAMESPACE=default \
-  uv run python -m temporal_client.examples.worker
-
-# Terminal 2 — trigger a workflow
-TEMPORAL_HOST=localhost:7233 TEMPORAL_NAMESPACE=default \
-  uv run python -m temporal_client.examples.starter start
-
-# Then approve or reject using the workflow ID printed above
-TEMPORAL_HOST=localhost:7233 TEMPORAL_NAMESPACE=default \
-  uv run python -m temporal_client.examples.starter approve <workflow-id>
+TEMPORAL_NAMESPACE=svc-orders
+TEMPORAL_TLS_CA=/path/to/infra/temporal/certs/ca.crt
+TEMPORAL_TLS_CERT=/path/to/infra/temporal/certs/svc-orders.crt
+TEMPORAL_TLS_KEY=/path/to/infra/temporal/certs/svc-orders.key
 ```
