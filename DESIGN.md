@@ -1,323 +1,627 @@
-# Workflow-as-a-Service Platform Design
+# Orchestration Service — High Level Design
 
-## Vision
+## 1. Overview
 
-A shared orchestration platform that lets internal teams expose their services and compose them into durable, auditable workflows — without writing orchestration code. Teams define workflows declaratively; the platform renders forms, executes steps, handles approvals, and manages failures.
+The Orchestration Service provides **Workflow as a Service (WaaS)** — a platform that lets any authorized team define, publish, and deliver their services through a consistent, durable, auditable request lifecycle. Teams do not write orchestration code. They define *what* their service requires and *how* it should be delivered; the platform executes it.
+
+**What it provides:**
+- A service catalog that end users browse to request resources and services
+- A workflow engine that durably executes multi-step delivery workflows, surviving failures and waiting days for approvals
+- Orchestration-managed primitives for cross-cutting concerns: change management, approvals, notifications, incident management
+- Orchestration service accounts for those primitives — teams do not need their own ServiceNow, SMTP, or AD credentials to participate
+- A dynamic form contract so any frontend can render request forms from catalog item definitions without custom code
+
+**Who uses it:**
+- **Workflow authors** — team members who define catalog items and delivery workflows (Linux team, DNS team, security team, etc.)
+- **End users / requesters** — anyone submitting a request through the catalog
+- **Approvers** — individuals or group members who act on pending approval gates
+- **Orchestration operators** — the orchestration team who own the service and its primitives
 
 ---
 
-## Platform Architecture
+## 2. Platform Context
+
+The hosting platform is a known quantity: ECS Fargate cluster, ALB with Entra OIDC authentication, Secrets Manager scoped per ECS task role, ECR for images, VPC with private subnets for services and public subnets for the ALB. Each service is an Entra registered application. Each ECS task has its own IAM role and policy. That infrastructure is not designed here.
+
+The platform provides a shared Aurora PostgreSQL cluster that services may opt into — the platform provisions a dedicated database on the shared cluster and injects the connection details. Services are not required to use it; they may provision their own database or use no database at all. The orchestration service uses the shared platform database for its request and audit records.
+
+The orchestration service is one service on that platform. It is the last architectural piece before teams begin decomposing existing systems into the new platform model.
 
 ```
-Platform Infrastructure (platform team owned)
-├── Temporal cluster           — platform primitive, like ECS or RDS
-│   ├── namespace: platform    — platform/onboarding workflows
-│   ├── namespace: orch-app    — orchestration app internal workflows
-│   ├── namespace: team-*      — one per team, provisioned on onboarding
-│   └── ...
-└── Temporal host injected into every ECS service as TEMPORAL_HOST
+End users / FE apps
+        │  (Entra token, user identity)
+        ▼
+Orchestration Service  ←─── workflow authors register catalog items via API
+        │  (Entra token, orchestration app identity)
+        ├──▶ Linux provisioning API
+        ├──▶ DNS provisioning API
+        ├──▶ Any registered team API
+        │
+        ├──▶ ServiceNow          (orchestration service account)
+        ├──▶ SMTP / notifications (orchestration service account)
+        └──▶ AD / directory      (orchestration service account)
 
-Platform Orchestration Service (ECS, orchestration team owned)
-├── API layer              — trigger workflows, query status, handle signals
-├── Service catalog UI     — self-service portal, dynamic forms, approval inbox
-├── Primitive library      — reusable activities (approval, ITSM, email, HTTP)
-├── Service registry       — registered team endpoints + auth config
-└── Workers
-    ├── orch-app namespace     — orchestration app's own internal workflows
-    └── team-* namespaces      — WaaS workflows requested via the service catalog
-                                 (dynamically served; teams don't need their own workers)
-
-Team ECS Service (optional worker)
-└── team-* namespace       — team's own internal workflows, if they choose to run them
+Shared Temporal instance  ←── owned by platform team, used by all services
+        │
+        ├── namespace: orchestration   (orchestration service workflows)
+        └── namespace: team-*          (team-internal workflows, optional)
 ```
 
-**Temporal is a platform primitive** — owned and operated by the platform team alongside ECS and URL namespace provisioning. The orchestration app connects to it the same way any other team would, with no special treatment.
+Team provisioning APIs are **headless from the orchestration perspective** — they have no awareness of the orchestration-initiated CHG, approval chain, or workflow. They receive a well-formed payload and provision the resource. Internally, a team service can use the shared core libraries with their own credentials to create CHGs for their own internal processes, call ServiceNow, or run Temporal workflows for complex provisioning sequences in their own namespace — the same libs, BYOC. They are Entra-protected and only reachable within the VPC.
+
+Each environment is a **separate AWS account**. Resource names do not embed environment names. S3 buckets are an exception due to the global namespace requirement — naming policy is `[company-prefix]-[user-selectable-name]-[env]`. No enforced naming convention for ECR repositories at this time.
 
 ---
 
-## Worker Ownership Model
+## 3. Core Concepts
 
-This is the key design decision that shapes everything else:
-
-| Workflow type | Namespace | Worker |
-|---|---|---|
-| Platform onboarding/offboarding | `platform` | Platform team worker |
-| Orchestration app internal workflows | `orch-app` | Orchestration app worker |
-| WaaS workflow requested via service catalog | `team-{name}` | Orchestration app worker (dynamic) |
-| Team's own internal workflows | `team-{name}` | Team's own worker (optional) |
-
-**WaaS workflows run in the requesting team's namespace but are executed by the orchestration app's worker.** This means:
-- Teams get isolated history and visibility without needing to run workers
-- The orchestration app's worker dynamically connects to each team namespace as WaaS workflows are registered
-- Teams that want their own internal orchestration can run their own worker in their namespace alongside the orchestration worker — task queue naming prevents collision
-
-```
-namespace: team-data-eng
-├── task queue: waas              ← orchestration app's worker listens here
-└── task queue: data-eng-internal ← team's own worker listens here (optional)
-```
-
----
-
-## Isolation Model
-
-Each team gets a dedicated Temporal namespace. This provides:
-
-- Isolated workflow history and execution state
-- Independent retention policies
-- Separate visibility in the UI
-- No cross-team data leakage
-
-Namespaces are created on team onboarding and deprecated on offboarding.
-
----
-
-## Team Onboarding / Offboarding
-
-Namespace lifecycle is automated via platform workflows running in the `platform` namespace.
-
-**Onboarding** (triggered when a team is provisioned on the platform):
-1. Create ECS service + URL namespace (existing platform flow)
-2. Create Temporal namespace for the team
-3. Inject `TEMPORAL_NAMESPACE` into the team's ECS environment
-4. Register team in the service catalog
-
-**Offboarding**:
-1. Pre-check: identify all workflows owned by this team — block offboarding until each is reassigned or deprecated
-2. Drain or terminate in-flight workflows (configurable grace period)
-3. Delete schedules
-4. Deprecate namespace (data expires per retention policy)
-5. Remove from service catalog
-
----
-
-## Orchestration App: Managed Service Model
-
-The orchestration app is a **managed service**, not a generic workflow runner. This distinction matters:
-
-- The orchestration team owns the worker, the primitives, and the credentials (ITSM, email, Slack, etc.)
-- Teams are consumers of the service — they define *what* to orchestrate, not *how* to execute it
-- The orchestration app's SLA, scaling, and deployment windows are the orchestration team's responsibility to manage
-- Worker capacity, noisy neighbor mitigation, and deployment impact on in-flight workflows are orchestration team concerns — teams accept this as part of the service contract
-
-This means teams cannot inject arbitrary code into WaaS workflows. They compose from the platform primitive library only.
-
----
-
-## Workflow Ownership
-
-Every workflow published to the service catalog must declare an owner. Ownership is a **publish-time requirement** — a workflow without a valid owner cannot be activated.
-
-```yaml
-ownership:
-  team: data-engineering
-  contact: data-eng@company.com
-  assignment_group: "DL-Data-Engineering"   # ServiceNow group, validated at publish
-  escalation_contact: jane.doe@company.com
-  review_date: 2027-01-01                   # workflow suspended and owner notified when passed
-```
-
-### What ownership enables
-
-- **Failure routing** — INC created on failure is auto-assigned to `assignment_group`, not a generic queue
-- **Failure notifications** — `contact` and `escalation_contact` are notified on failure or SLA breach
-- **Catalog governance** — only workflows with validated owners are visible in the catalog
-- **Revalidation** — when `review_date` passes, the workflow is suspended and the owner is notified to revalidate or deprecate
-- **Audit trail** — every execution record is tied to an owning team
-- **Offboarding safety** — when a team is offboarded, any workflows they own must be reassigned or deprecated before the namespace is torn down
-
-### Enforcement
-
-| Rule | Enforced at |
+| Term | Definition |
 |---|---|
-| `ownership` block required | Schema validation on publish |
-| `assignment_group` must exist in ServiceNow | ServiceNow API call at publish time |
-| `contact` must be a valid directory user or group | Directory lookup at publish time |
-| Workflow cannot be triggered without a valid owner | Runtime check on trigger |
-| `review_date` expired → workflow suspended | Scheduled background job; owner notified |
-| Team offboarding blocked until owned workflows are resolved | Offboarding workflow pre-check |
+| **Catalog item** | A published, requestable service. Defines what inputs are required, what templates apply, what approval policy governs it, and which workflow delivers it. |
+| **Workflow definition** | The ordered sequence of steps that delivers a catalog item. References primitives and team API endpoints. Versioned independently of the catalog item. |
+| **Request** | A single instance of a catalog item being fulfilled. Created when an end user submits the form. Has a lifecycle from submitted to terminal state. |
+| **Primitive** | An orchestration-provided, reusable workflow step. Executes using orchestration service accounts. Examples: `create_chg`, `approval_gate`, `send_notification`. |
+| **Template** | A named, reusable content definition bound to a catalog item. Used by primitives at runtime. Examples: CHG templates, email templates, DNS note templates. |
+| **Workflow author** | A team member who defines a catalog item and its delivery workflow via the orchestration API. Does not write Temporal code. |
+| **Compensation** | The undo activity declared per step. Executed in reverse order during a cancel operation. |
 
 ---
 
-## Workflow Definition Format
+## 4. Catalog Item Anatomy
 
-Teams author YAML workflow definitions. The platform parses and executes them as durable Temporal workflows — teams do not write Temporal code.
+A catalog item is the unit of registration. Workflow authors submit it via the orchestration API.
 
 ```yaml
-name: provision-database
-namespace: team-data-eng
-version: 1
-description: "Provision a managed database instance"
+catalog_item:
+  name: "Linux VM"
+  description: "Provision a standard Linux virtual machine"
+  category: "Compute"
+  version: 2                          # incremented on each publish
+  status: published                   # draft | published | deprecated
 
-ownership:
-  team: data-engineering
-  contact: data-eng@company.com
-  assignment_group: "DL-Data-Engineering"
-  escalation_contact: jane.doe@company.com
-  review_date: 2027-01-01
+  # Catalog item ownership — separate from the requester
+  ownership:
+    system_owner: jane.doe@company.com
+    technical_contact: linux-team@company.com
+    business_owner: dept-head@company.com
+    cost_center: "CC-1042"
 
-inputs:
-  - id: environment
-    label: "Target Environment"
-    type: select
-    options: [dev, staging, prod]
-    required: true
+  # Templates bound to this catalog item
+  templates:
+    chg: "tmpl-linux-vm-standard"
+    notification_submitted: "tmpl-notify-submitted"
+    notification_complete: "tmpl-notify-vm-ready"
+    notification_rejected: "tmpl-notify-rejected"
 
-  - id: db_name
-    label: "Database Name"
-    type: text
-    pattern: "^[a-z][a-z0-9_]{2,30}$"
-    required: true
+  # Approval policy
+  approval:
+    steps:
+      - id: manager_approval
+        type: serial
+        approvers:
+          - type: person
+            resolver: manager_of_requester
+      - id: security_approval
+        type: parallel
+        condition: "inputs.environment == 'prod'"
+        approvers:
+          - type: group
+            id: "DL-Security-Approvers"
 
-  - id: size
-    label: "Instance Size"
-    type: select
-    options: [small, medium, large]
-    default: small
+  # Input schema — drives dynamic form generation
+  inputs:
+    schema:
+      type: object
+      required: [hostname, size, disk_gb, environment]
+      properties:
+        hostname:
+          type: string
+          title: "Hostname"
+          pattern: "^[a-z][a-z0-9\\-]{2,30}$"
+        size:
+          type: string
+          title: "Instance Size"
+          enum: ["2x4", "4x8", "8x16"]
+        disk_gb:
+          type: integer
+          title: "Disk (GB)"
+          minimum: 20
+          maximum: 2000
+        environment:
+          type: string
+          title: "Environment"
+          enum: ["dev", "staging", "prod"]
+        justification:
+          type: string
+          title: "Business Justification"
+          description: "Required for production requests"
+    ui:
+      justification:
+        widget: textarea
+        condition: "inputs.environment == 'prod'"
 
-  - id: justification
-    label: "Business Justification"
-    type: textarea
-    required: true
-    visible_when: "inputs.environment == 'prod'"
+  # Reference to the workflow that delivers this item
+  workflow: linux-vm-provision
+  workflow_version: 3
+```
+
+### Standard platform fields
+
+Collected on every request regardless of catalog item. Pre-populated where possible from the requester's Entra profile. Not defined by the workflow author.
+
+| Field | Source |
+|---|---|
+| `requester_upn` | Entra token |
+| `requester_display_name` | Entra token |
+| `cost_center` | Entra profile attribute |
+| `department` | Entra profile attribute |
+| `manager_upn` | Entra profile / Graph API |
+| `submitted_at` | Platform, at trigger time |
+
+### Versioning
+
+- A catalog item has one active version at any time
+- Authors work in `draft` status until ready to publish
+- Publishing increments the version and sets status to `published`
+- A previous version can be restored as the active version; only one version is ever active
+- In-flight requests always complete on the version they were triggered against — the orchestration service stores a snapshot of the catalog item and workflow definition at trigger time, not a pointer to current
+
+---
+
+## 5. Workflow Definition Format
+
+Workflow definitions are authored in YAML and registered via the orchestration API. They are versioned independently of the catalog item that references them.
+
+```yaml
+name: linux-vm-provision
+version: 3
+description: "Full lifecycle delivery of a Linux VM"
 
 steps:
   - id: open_chg
-    type: create_change_request
+    type: create_chg
     params:
-      title: "Provision DB: ${inputs.db_name}"
+      template: "${catalog.templates.chg}"
+      title: "Provision Linux VM: ${inputs.hostname}"
       environment: "${inputs.environment}"
 
   - id: manager_approval
     type: approval_gate
+    ref: "${catalog.approval.steps.manager_approval}"
     params:
-      approvers: ["${inputs.manager_email}"]
       timeout: 48h
+      on_timeout: abandon
 
-  - id: provision
+  - id: security_approval
+    type: approval_gate
+    ref: "${catalog.approval.steps.security_approval}"
+    condition: "${inputs.environment == 'prod'}"
+    params:
+      timeout: 24h
+      on_timeout: abandon
+
+  - id: reserve_ip
     type: service_call
     params:
-      service: team-data-eng
-      endpoint: /databases
+      url: "${services.dns}/ip-reservations"
       method: POST
-      body: "${inputs}"
+      body:
+        hostname: "${inputs.hostname}"
+        requester: "${request.requester_upn}"
+    compensation:
+      url: "${services.dns}/ip-reservations/${steps.reserve_ip.output.reservation_id}"
+      method: DELETE
 
-  - id: notify
+  - id: create_netgroup
+    type: service_call
+    params:
+      url: "${services.linux}/netgroups"
+      method: POST
+      body:
+        hostname: "${inputs.hostname}"
+    compensation:
+      url: "${services.linux}/netgroups/${steps.create_netgroup.output.netgroup_id}"
+      method: DELETE
+
+  - id: provision_vm
+    type: service_call
+    params:
+      url: "${services.linux}/vms"
+      method: POST
+      body:
+        hostname: "${inputs.hostname}"
+        size: "${inputs.size}"
+        disk_gb: "${inputs.disk_gb}"
+        ip: "${steps.reserve_ip.output.ip_address}"
+        netgroup: "${steps.create_netgroup.output.netgroup_id}"
+        tags:
+          cost_center: "${request.cost_center}"
+          owner: "${request.requester_upn}"
+          department: "${request.department}"
+    compensation:
+      url: "${services.linux}/vms/${steps.provision_vm.output.vm_id}"
+      method: DELETE
+
+  - id: close_chg
+    type: close_chg
+    params:
+      chg_id: "${steps.open_chg.output.chg_id}"
+      resolution: "Provisioning completed successfully"
+
+  - id: notify_complete
     type: send_notification
     params:
-      to: "${inputs.requester_email}"
-      message: "Database ready: ${steps.provision.output.connection_string}"
+      template: "${catalog.templates.notification_complete}"
+      to: "${request.requester_upn}"
+      data:
+        hostname: "${inputs.hostname}"
+        ip: "${steps.reserve_ip.output.ip_address}"
+        vm_id: "${steps.provision_vm.output.vm_id}"
 
 on_failure:
   - type: create_incident
     params:
-      title: "DB provision failed: ${inputs.db_name}"
+      title: "VM provision failed: ${inputs.hostname}"
       linked_chg: "${steps.open_chg.output.chg_id}"
+      assignment_group: "${catalog.ownership.technical_contact}"
+  - type: wait_for_incident_resolution
+    params:
+      timeout: 72h
+      on_timeout: abandon
 ```
 
-### Input Field Types
+### Expression syntax
 
-| Type | Use case |
+Steps reference prior outputs and request context via `${}` expressions:
+- `${inputs.*}` — requester-provided form fields
+- `${request.*}` — platform standard fields (requester_upn, cost_center, etc.)
+- `${steps.<id>.output.*}` — output from a prior step
+- `${catalog.*}` — catalog item metadata (templates, ownership)
+- `${services.*}` — base URLs from orchestration service configuration
+
+### Step types
+
+| Type | Description |
 |---|---|
-| `text` | Single-line string with optional regex validation |
-| `textarea` | Multi-line text (justifications, descriptions) |
-| `select` | Enum from a fixed list |
-| `multi-select` | Multiple values from a list |
-| `boolean` | Checkbox |
-| `number` | Numeric with optional min/max |
-| `date` | Date picker |
-| `user` | People picker (resolves to email/ID) |
-
-Fields support `visible_when` for conditional rendering and `required_when` for conditional validation.
+| `create_chg` | Opens a change record using the orchestration service account and the referenced template |
+| `update_chg` | Adds a work note or progress comment to an open CHG mid-workflow |
+| `close_chg` | Closes a change record with an outcome (success, cancelled, failed) |
+| `approval_gate` | Suspends execution, notifies approvers, resumes on signal |
+| `service_call` | Authenticated HTTP call to a team provisioning API |
+| `send_notification` | Email or messaging notification using a template |
+| `create_incident` | Creates an INC in the ITSM system |
+| `wait_for_incident_resolution` | Polls INC status, resumes workflow when INC is closed |
+| `condition` | Branches based on expression evaluation |
+| `parallel` | Fans out multiple steps, waits for all to complete |
+| `wait` | Pauses for a fixed duration or until a specified time |
+| `transform` | Reshapes data between steps without an external call |
 
 ---
 
-## Primitive Library
+## 6. Primitive Library
 
-Platform-maintained Temporal activities available to all workflow definitions.
+Primitives are orchestration-maintained Temporal activities. They execute using orchestration service credentials — workflow authors do not supply credentials for these.
 
-| Primitive | Description |
+### `approval_gate`
+Suspends the workflow and notifies approvers. Resumes when all required approvals are received or the timeout is reached.
+
+Supports:
+- **Serial** — approvers notified in order; each must approve before the next is notified
+- **Parallel** — all approvers notified simultaneously; all must approve
+- **Conditional** — step is skipped entirely if condition evaluates to false at runtime
+
+### `create_chg`
+Opens a change record in the ITSM system using the orchestration service account. The CHG template referenced in the catalog item controls format, categorization, and required fields. The CHG is branded as the orchestration service — teams do not need their own ITSM service accounts. Returns a `chg_id` available to subsequent steps via `${steps.<id>.output.chg_id}`.
+
+### `update_chg`
+Adds a work note or progress comment to an open CHG. Used mid-workflow to keep the CHG as a living record of what happened during provisioning — IP reserved, VM provisioned, approval received — rather than just an open/close bookend. Useful for audit trail within the ITSM system independent of the orchestration service's own audit log.
+
+### `close_chg`
+Closes a change record with an explicit outcome. Accepts an `outcome` parameter: `success`, `cancelled`, or `failed`. The closure code and resolution notes written to the CHG reflect the outcome — a failed or rejected workflow closes differently than a successful one.
+
+### `create_incident`
+Creates an INC and assigns it to the catalog item's technical contact group. Typically used in `on_failure` blocks. Links to the associated CHG if one exists.
+
+### `wait_for_incident_resolution`
+Polls the INC until it reaches a resolved/closed state, then automatically signals the workflow to resume. Closes the loop between workflow failure and manual remediation. Configured timeout triggers abandonment if the INC is not resolved in time.
+
+### `send_notification`
+Sends email or messaging notifications using a template defined in the catalog item. Executed using orchestration service credentials. Template data is populated from request context and step outputs.
+
+### `service_call`
+Authenticated HTTP call to a team provisioning API. The orchestration service calls using its Entra app identity — the target service must have granted API permission to the orchestration app registration. The originating requester's UPN is passed in the request payload as metadata, not as an auth token.
+
+### `condition`
+Evaluates an expression against input fields or prior step outputs and branches the workflow. Supports simple field comparisons at definition time; runtime expression evaluation against step outputs.
+
+### `parallel`
+Fans out a set of steps and waits for all to complete before proceeding. Used for concurrent provisioning steps that have no dependency on each other.
+
+### `wait`
+Pauses the workflow for a fixed duration or until a datetime. Useful for scheduled follow-up steps or enforced cooling-off periods.
+
+---
+
+## 7. Approval Model
+
+### Approver types
+
+| Type | Description |
 |---|---|
-| `approval_gate` | Suspends workflow, notifies approvers, resumes on approve/reject signal |
-| `service_call` | Authenticated HTTP call to a registered team service |
-| `create_change_request` | Creates a CHG in the ITSM system |
-| `create_incident` | Creates an INC; typically used in `on_failure` |
-| `send_notification` | Email, Slack, or Teams message |
-| `condition` | Branches workflow based on expression over prior step output |
-| `parallel` | Fan-out multiple steps; waits for all (or first) to complete |
-| `wait` | Pauses for a duration or until a specified time |
-| `transform` | Maps/reshapes data between steps without a service call |
+| `person` | Named individual by UPN |
+| `group` | AD group; any member may approve |
+| `resolver` | Orchestration-resolved identity (e.g. `manager_of_requester`) |
+
+### Approval structure
+
+Approval steps are declared on the catalog item and referenced by workflow steps. A catalog item may have multiple approval steps executed in the sequence defined by the workflow.
+
+**Serial** — approvers are notified in order. Each must act before the next receives notification.
+
+**Parallel** — all approvers notified simultaneously. All must approve for the gate to pass.
+
+**Conditional** — the entire approval step is skipped if the condition evaluates false at trigger time.
+
+### Self-approval
+
+**Open design question.** When the resolved approver identity matches the requester identity, the correct behavior is not yet defined. Escalation rules, secondary approver requirements, and policy ownership (platform-enforced vs workflow-author-declared) need further design. This is a known gap and will be addressed before the approval gate primitive is built.
+
+### Notification
+
+Approvers are notified when an approval gate activates. The delivery mechanism is abstracted — the approval gate triggers a notification event and the orchestration service delivers it via one or more configured channels. The approve/reject action is always an API call (`POST /requests/{id}/approvals/{step_id}/approve`) regardless of delivery channel; the notification carries whatever link or inline action the channel supports.
+
+Planned delivery mechanisms (v1 starts with one, others added without changing workflow definitions):
+- Email
+- Microsoft Teams
+- Orchestration portal (pending approval inbox)
+- SMS (escalation / timeout scenarios)
+
+Delivery preference can be configured at the orchestration service level, the catalog item level, or per approver.
 
 ---
 
-## Service Registry
+## 8. Request Lifecycle
 
-Teams register their services so they can be referenced by name in `service_call` steps. The registry stores:
-
-- Service name (used in workflow definitions)
-- Base URL (resolved to the team's platform URL namespace)
-- Auth method (IAM role on orchestration ECS task, or per-service token in Secrets Manager)
-- Available endpoints + expected request/response schema (optional, enables validation)
-
-Teams can register services via the platform API or a config file in their repo.
-
----
-
-## Service Catalog & Self-Service Portal
-
-Every registered workflow definition automatically appears in the catalog.
+### States
 
 ```
-Request something
-├── Data Engineering
-│   └── Provision Database        → [generated form] → submit → triggers workflow
-├── Platform
-│   └── Create ECS Service        → [generated form]
-└── Security
-    └── Request Elevated Access   → [generated form]
+submitted
+    │
+    ▼
+pending_approval       ← paused at one or more approval gates
+    │
+    ▼
+provisioning           ← steps executing
+    │
+    ├──▶ completed     ← all steps succeeded
+    ├──▶ failed        ← step failed, INC created, waiting for resolution
+    ├──▶ cancelled     ← cancel requested, compensation running
+    └──▶ abandoned     ← terminated without compensation
 ```
 
-The form is generated from the workflow's `inputs` block. On submit, the platform validates input, starts the Temporal workflow, and returns a request ID the user can track.
+### Cancel
 
-Users also have an **approval inbox** — pending `approval_gate` steps appear here with context and approve/reject actions.
+A cancel signal can be sent to any request that has not reached a terminal state. Once received:
+1. The current step is allowed to complete or time out
+2. Compensation activities are executed in reverse order for all completed steps that declared one
+3. The CHG is closed as cancelled
+4. The requester is notified
 
----
+Cancel is only meaningful before provisioning is complete. The orchestration service enforces this — a cancel signal after `completed` is rejected.
 
-## Open Design Decisions
+### Resume
 
-### 1. Dynamic vs. compiled workflows
-**Dynamic**: one generic Temporal workflow class interprets the step list at runtime. Simpler to build; step definitions can change without redeploying workers.  
-**Compiled**: code-generate a Temporal workflow class per definition. Better replay safety (Temporal requires deterministic history); more complex build pipeline.  
-*Lean: dynamic to start, with versioning on the definition to handle replay.*
+When a step fails, the workflow parks in `failed` state and an INC is created. Two resume paths:
 
-### 2. Workflow definition storage
-Where do teams store and version their YAML definitions?  
-- **Git-backed** (PR = deploy): best for auditability, fits GitOps culture  
-- **API/UI managed**: lower friction for non-engineers  
-- **Hybrid**: Git as source of truth, UI for read/trigger only
+**Auto-resume** — `wait_for_incident_resolution` primitive polls the INC. When it is closed, the workflow automatically retries the failed step and continues. No human signal to the platform required.
 
-### 3. Approval UX
-Where do approvers take action?  
-- **Platform UI** (simplest to build)  
-- **Email link** (most convenient, no login required)  
-- **Slack** (highest adoption for internal tools)
+**Manual resume** — an operator sends an explicit resume signal via the orchestration API after resolving the external condition. The workflow retries from the failed step.
 
-### 4. Service call auth
-When the orchestration service calls a team's registered endpoint:  
-- **IAM role** on the orchestration ECS task (cleanest if teams are on the same AWS account/org)  
-- **Per-service API tokens** stored in Secrets Manager (works cross-account)
+### Abandon
 
-### 5. Workflow versioning
-When a team updates a workflow definition, in-flight executions should complete on the version they started with. The definition layer needs versioning independent of Temporal's internal versioning.
-
-### 6. Team-owned workers
-Teams that need internal orchestration beyond what WaaS provides can run a Temporal worker in their ECS service. They connect to the platform cluster using their injected `TEMPORAL_HOST` and `TEMPORAL_NAMESPACE`, choose a task queue name that doesn't conflict with `waas`, and own their workflow/activity code entirely. The platform provides the namespace — teams bring the code.
+Terminates the workflow immediately. No compensation is run. An INC is created if one does not already exist. The associated CHG is closed as failed. Used when the workflow is stuck in a state where compensation would be harmful or meaningless. Manual cleanup of any partial provisioning is the responsibility of the owning team.
 
 ---
 
-## What's Not in Scope (Yet)
+## 9. Auth & Credentials
 
-- Cross-team workflow composition (one team's workflow calling another team's workflow)
-- External trigger sources (webhooks, schedule-based, event bus)
-- Workflow analytics / SLA tracking
-- Multi-region or HA Temporal cluster
+### Service-to-service auth
+
+Every service on the platform is an Entra registered application. The orchestration service holds API permissions granted by each team's app registration.
+
+```
+End user → Orchestration   Entra user token      orchestration validates identity
+Orchestration → Linux API  Entra app token        Linux team grants permission to orchestration app
+Orchestration → DNS API    Entra app token        DNS team grants permission to orchestration app
+Orchestration → ServiceNow Orchestration service acct  stored in Secrets Manager, orchestration ECS role
+Orchestration → SMTP       Orchestration service acct  stored in Secrets Manager, orchestration ECS role
+```
+
+### Originating user identity
+
+When the orchestration service calls a team provisioning API, the end user's identity is not forwarded as an auth token. The team API authenticates the orchestration service's app identity. The originating requester's UPN and other standard fields are included in the request payload as data — for resource tagging, audit, and ownership attribution on the provisioned resource.
+
+### Secrets
+
+Each ECS task role is scoped to its own Secrets Manager path by the platform. The orchestration service accesses its credentials (ITSM, SMTP, AD) via its task role. Team services access their credentials via their own task role. Credentials to external systems are stored in Secrets Manager regardless of origin — even third-party vaults are accessed via a Secrets Manager reference. Secret resolution in workflow step execution follows the same pattern: the orchestration worker resolves secrets at activity execution time using its task role.
+
+### BYOC vs orchestration credentials
+
+The shared core libraries support both modes. When a team calls a shared lib from their own service with their own creds, they supply the secret reference. When the orchestration service calls the same lib as a primitive activity, it supplies its own orchestration credentials. The lib does not distinguish — credential sourcing is the caller's concern.
+
+---
+
+## 10. Audit & Compliance
+
+The orchestration service maintains its own database (a dedicated database on the platform's shared Aurora PostgreSQL cluster) as the authoritative record of requests and their history. Temporal's execution history is the source of truth for workflow execution, but is not the primary query surface for compliance or reporting.
+
+### What is recorded
+
+| Record | Contents |
+|---|---|
+| Request | request_id, catalog_item, version snapshot, requester_upn, submitted_at, current_state, terminal_state, terminal_at |
+| Step execution | request_id, step_id, step_type, started_at, completed_at, status, input snapshot, output snapshot |
+| Approval decision | request_id, step_id, approver_upn, decision (approved/rejected), decided_at, comment |
+| Ticket reference | request_id, step_id, ticket_type (CHG/INC), ticket_id, created_at, closed_at |
+
+### API endpoints for status and history
+
+```
+GET  /requests                          list requests (filterable by state, requester, catalog item, date)
+GET  /requests/{id}                     full request detail with current state
+GET  /requests/{id}/steps               step-by-step execution history
+GET  /requests/{id}/approvals           approval decisions and pending gates
+GET  /requests/{id}/tickets             CHG and INC references
+
+POST /requests/{id}/cancel              request cancellation
+POST /requests/{id}/resume              manual resume signal
+POST /requests/{id}/abandon             abandon without compensation
+
+POST /requests/{id}/approvals/{step_id}/approve
+POST /requests/{id}/approvals/{step_id}/reject
+```
+
+Structured JSON logs are emitted to CloudWatch for every state transition, step execution, and approval decision. These are the compliance audit trail and are independent of the API.
+
+---
+
+## 11. API Surface
+
+The orchestration service is API-first. All functionality is exposed via the API. A frontend or BFF adapter consumes this API but is independent of it.
+
+### Catalog API (end user surface)
+```
+GET  /catalog                           list all published catalog items by category
+GET  /catalog/{item_id}                 catalog item detail including full input schema
+GET  /catalog/{item_id}/schema          JSON Schema for the item's input form (dynamic form contract)
+POST /catalog/{item_id}/requests        submit a request; returns request_id
+```
+
+### Request API (end user surface)
+```
+GET  /requests                          requester's request history
+GET  /requests/{id}                     request status and detail
+GET  /requests/{id}/steps               execution timeline
+POST /requests/{id}/cancel
+POST /requests/{id}/resume
+POST /requests/{id}/approvals/{step_id}/approve
+POST /requests/{id}/approvals/{step_id}/reject
+```
+
+### Approval inbox (approver surface)
+```
+GET  /approvals/pending                 all approval gates pending the caller's action
+```
+
+### Authoring API (workflow author surface)
+```
+GET    /definitions/catalog-items                      list all catalog items the caller owns
+POST   /definitions/catalog-items                      register or update a catalog item (draft)
+POST   /definitions/catalog-items/{id}/publish         publish current draft
+POST   /definitions/catalog-items/{id}/rollback        restore previous published version
+GET    /definitions/workflows                           list workflow definitions
+POST   /definitions/workflows                          register or update a workflow definition
+GET    /definitions/templates                           list available templates
+POST   /definitions/templates                          register a template
+
+GET    /definitions/catalog-items/{id}/validate        validate definition against schema
+```
+
+### Dynamic form contract
+
+`GET /catalog/{item_id}/schema` returns a JSON Schema document plus UI hints. Any frontend that can render JSON Schema can generate a functional, validated form for any catalog item without custom code. Hosting platform standard fields (cost center, department) are pre-populated from the Entra token by the API — the form schema only includes fields the requester must explicitly provide.
+
+---
+
+## 12. Shared Libraries
+
+The hosting platform provides shared core Python libraries available to all services. The orchestration service consumes these as Temporal activity implementations.
+
+| Library | Provides |
+|---|---|
+| `temporal-client` | `get_client()`, `build_worker()` — Temporal connection for any service |
+| `platform-aws` | AWS service abstractions (S3, EC2, Secrets Manager, etc.) |
+| `platform-entra` | Entra token acquisition, Graph API queries, group membership |
+| `platform-itsm` | ServiceNow CHG and INC create/update/close |
+| `platform-notifications` | Email and messaging with template rendering |
+| `platform-dns` | DNS record and IP reservation abstractions |
+| `platform-ad` | AD group management, user lookups |
+| `platform-db` | Database connection factory |
+
+All libraries support BYOC — the caller supplies a secret reference and the lib resolves it from Secrets Manager at call time. When the orchestration service calls these libs as primitive activities it supplies orchestration-scoped secret references. When a team calls these libs from their own service they supply their own secret references scoped to their task role.
+
+---
+
+## 13. AI-Assisted Authoring
+
+The YAML-based authoring model is intentionally well-suited to AI assistance. The workflow definition format has a defined schema, a finite primitive library, and a constrained expression language — all of which are things a language model can learn and reliably produce output against.
+
+### AI-assisted catalog item drafting
+
+A workflow author describes what they want to offer in plain language. An AI assistant drafts the complete catalog item YAML, workflow YAML, and CHG template. The author reviews, adjusts, and submits via the authoring API. The schema validation on publish catches structural errors before anything runs.
+
+```
+Author: "Sudo access request for a Linux server. Requester provides hostname
+         and justification. Manager must approve. If the server is production,
+         security team also approves. Linux team API grants access."
+
+AI: drafts catalog_item.yaml, workflow.yaml, chg-template.j2
+
+Author: reviews approval group names, adjusts timeouts, submits
+```
+
+The author is a reviewer and tuner, not a writer. This is the right division of labor for a structured format with known constraints.
+
+### MCP server
+
+The orchestration service exposes an MCP (Model Context Protocol) server alongside its REST API. This allows any MCP-compatible AI assistant to interact with the orchestration service directly as a set of tools — reading the catalog, drafting definitions, validating and submitting them, and checking request status.
+
+Proposed MCP tools:
+
+| Tool | Description |
+|---|---|
+| `list_catalog_items` | Browse published catalog items by category |
+| `get_primitive_library` | Return the full primitive library with parameter schemas — gives the AI the vocabulary it can use in workflow steps |
+| `get_definition_schema` | Return the JSON Schema for catalog item and workflow definitions — the grammar the AI must conform to |
+| `draft_catalog_item` | Given a natural language description, produce a draft catalog item and workflow YAML |
+| `validate_definition` | Validate a draft definition against the schema and return errors |
+| `submit_definition` | Submit a validated draft via the authoring API |
+| `list_requests` | Query request history and status |
+| `get_request` | Get full detail and execution timeline for a request |
+| `get_pending_approvals` | List approval gates pending the caller's action |
+| `approve_request` | Send an approval decision |
+
+Authentication to the MCP server follows the same Entra token model as the REST API — the AI assistant acts on behalf of the authenticated user, not with elevated permissions.
+
+### Longer-term: AI agent for service onboarding
+
+Once the authoring API and MCP server are stable, the natural next step is an AI agent that a team can describe their service to and receive a complete, ready-to-review catalog item package. The agent would:
+
+1. Ask clarifying questions about inputs, approval requirements, and the team's provisioning API
+2. Draft the catalog item, workflow definition, and templates
+3. Validate against the schema
+4. Present the draft for human review
+5. Submit on confirmation
+
+This is straightforward to build once the YAML format is stable and the MCP server exists. The constrained expression language is an advantage here — a smaller, well-defined grammar produces more reliable AI output than an open-ended one, which is another reason to define its ceiling deliberately.
+
+---
+
+## 15. Open Design Questions
+
+**Self-approval** — when the resolved approver identity matches the requester identity, behavior is undefined. Escalation rules, secondary approver policy, and whether this is platform-enforced or workflow-author-declared require further design.
+
+**Rollback completeness** — compensation activities cover the happy-path undo case. Partial failures mid-compensation (compensation step itself fails) and workflows where some steps have no meaningful compensation need defined handling.
+
+**Workflow definition format edge cases** — complex conditional branching, loops, and dynamic step generation from prior step output are not covered by the current step model. The boundary between what is expressible in the definition format and what requires a team-internal Temporal workflow needs to be drawn explicitly.
+
+---
+
+## 16. Out of Scope for v1
+
+- **Frontend portal** — a separate application consuming the catalog and request APIs. The API provides everything needed; the portal is a consumer of it.
+- **BFF adapter** — an optional facade between a specific frontend and the orchestration API. Independent of the API itself.
+- **Metrics and analytics** — request volume, approval SLA tracking, step failure rates, catalog item usage. The data model supports it; the reporting surface is deferred.
+- **Scheduled workflows** — catalog items triggered on a schedule rather than by a requester. The Temporal infrastructure supports it; the authoring model for it is deferred.
+- **Cross-team Temporal child workflows** — one team's workflow directly invoking another team's Temporal workflow as a child workflow. Cross-team composition is supported via `service_call` to the owning team's API, which is the correct pattern and preserves credential and ownership boundaries.
+- **External webhook triggers** — initiating a request from an external event source.
