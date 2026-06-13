@@ -430,12 +430,41 @@ Terminates the workflow immediately. No compensation is run. An INC is created i
 Every service on the platform is an Entra registered application. The orchestration service holds API permissions granted by each team's app registration.
 
 ```
-End user → Orchestration   Entra user token      orchestration validates identity
-Orchestration → Linux API  Entra app token        Linux team grants permission to orchestration app
-Orchestration → DNS API    Entra app token        DNS team grants permission to orchestration app
+End user → Orchestration   Entra user token            orchestration validates identity
+Orchestration → Linux API  Entra app token, app role   Linux team grants role to orchestration app
+Orchestration → DNS API    Entra app token, app role   DNS team grants role to orchestration app
 Orchestration → ServiceNow Orchestration service acct  stored in Secrets Manager, orchestration ECS role
 Orchestration → SMTP       Orchestration service acct  stored in Secrets Manager, orchestration ECS role
 ```
+
+### App roles
+
+Each team's app registration defines app roles representing logical access levels rather than individual endpoint permissions. The orchestration service is assigned one role per target service — that role covers all endpoints the orchestration service is permitted to call.
+
+Example — Linux team app registration:
+
+```
+App roles:
+  linux.provision   — POST /vms, POST /netgroups, POST /sudo-grants, etc.
+  linux.read        — GET endpoints only
+  linux.admin       — full access including decommission endpoints
+```
+
+The orchestration app registration requests `linux.provision`. The Linux API validates the role on the incoming token — not the specific endpoint being called. One role grants access to the full provisioning surface.
+
+The orchestration service's accumulated permissions across all team services:
+
+```
+API permissions held by orchestration app registration:
+  linux-api     → linux.provision
+  dns-api       → dns.provision
+  windows-api   → windows.provision
+  ...
+```
+
+The `service_call` primitive acquires a token scoped to the target service's app ID. The role is already embedded in what was granted — no per-call role selection needed. The call either succeeds or returns 403.
+
+**Governance:** each team explicitly assigns the orchestration app registration their role in their Entra app manifest. That assignment is the team's consent to allow orchestration to call their service. It is auditable, revocable, and owned by the team.
 
 ### Originating user identity
 
