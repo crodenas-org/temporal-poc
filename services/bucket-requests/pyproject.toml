@@ -1,0 +1,22 @@
+[project]
+name = "svc-bucket-requests"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "temporal-client",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+temporal-client = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bucket_requests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

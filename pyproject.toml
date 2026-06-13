@@ -6,3 +6,6 @@ dependencies = []
 
 [tool.uv]
 package = false
+
+[tool.uv.workspace]
+members = ["libs/*", "services/*"]

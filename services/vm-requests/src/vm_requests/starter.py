@@ -1,47 +1,56 @@
 """
 Usage:
-  uv run python -m temporal_client.examples.starter start [ORDER_ID]
-  uv run python -m temporal_client.examples.starter approve WORKFLOW_ID
-  uv run python -m temporal_client.examples.starter reject  WORKFLOW_ID
-  uv run python -m temporal_client.examples.starter result  WORKFLOW_ID
+  uv run python -m vm_requests.starter start
+  uv run python -m vm_requests.starter approve WORKFLOW_ID
+  uv run python -m vm_requests.starter reject  WORKFLOW_ID
+  uv run python -m vm_requests.starter result  WORKFLOW_ID
 """
 import asyncio
 import logging
 import sys
 import uuid
 from temporal_client import get_client
-from .models import Order
-from .workflows import OrderWorkflow
+from .models import VMRequest
+from .workflows import VMRequestWorkflow
 
-TASK_QUEUE = "order-queue"
+TASK_QUEUE = "vm-requests-queue"
 UI_BASE = "http://localhost:8080/namespaces/default/workflows"
 
 
-async def cmd_start(order_id: str | None) -> None:
+async def cmd_start() -> None:
     client = await get_client()
-    order_id = order_id or f"ORD-{uuid.uuid4().hex[:8].upper()}"
-    order = Order(order_id=order_id, customer_id="CUST-001", items=["Widget A", "Gadget B"], total_amount=99.99)
-    workflow_id = f"order-{order_id}"
-    handle = await client.start_workflow(OrderWorkflow.run, order, id=workflow_id, task_queue=TASK_QUEUE)
-    print(f"Workflow started")
+    request_id = uuid.uuid4().hex[:8].upper()
+    req = VMRequest(
+        request_id=request_id,
+        requester_email="alice@example.com",
+        instance_type="t3.medium",
+        os="ubuntu-22.04",
+        purpose="dev environment for project X",
+        team="platform",
+    )
+    workflow_id = f"vm-request-{request_id}"
+    handle = await client.start_workflow(
+        VMRequestWorkflow.run, req, id=workflow_id, task_queue=TASK_QUEUE
+    )
+    print(f"VM request submitted")
+    print(f"  Request ID  : {req.request_id}")
     print(f"  Workflow ID : {handle.id}")
-    print(f"  Namespace   : {client.namespace}")
     print(f"  UI          : {UI_BASE}/{handle.id}")
     print()
-    print(f"Approve : uv run python -m temporal_client.examples.starter approve {handle.id}")
-    print(f"Reject  : uv run python -m temporal_client.examples.starter reject  {handle.id}")
+    print(f"Approve : uv run python -m vm_requests.starter approve {handle.id}")
+    print(f"Reject  : uv run python -m vm_requests.starter reject  {handle.id}")
 
 
 async def cmd_signal(workflow_id: str, signal: str) -> None:
     client = await get_client()
     handle = client.get_workflow_handle(workflow_id)
     if signal == "approve":
-        await handle.signal(OrderWorkflow.approve)
+        await handle.signal(VMRequestWorkflow.approve)
         print(f"APPROVE signal sent to {workflow_id}")
     else:
-        await handle.signal(OrderWorkflow.reject)
+        await handle.signal(VMRequestWorkflow.reject)
         print(f"REJECT signal sent to {workflow_id}")
-    print(f"  Result : uv run python -m temporal_client.examples.starter result {workflow_id}")
+    print(f"  Result : uv run python -m vm_requests.starter result {workflow_id}")
 
 
 async def cmd_result(workflow_id: str) -> None:
@@ -59,7 +68,7 @@ async def main() -> None:
         sys.exit(1)
     cmd = args[0]
     if cmd == "start":
-        await cmd_start(args[1] if len(args) > 1 else None)
+        await cmd_start()
     elif cmd in ("approve", "reject"):
         if len(args) < 2:
             print(f"Usage: starter.py {cmd} WORKFLOW_ID")

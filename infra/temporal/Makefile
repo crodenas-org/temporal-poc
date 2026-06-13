@@ -1,21 +1,23 @@
-COMPOSE   = podman compose
-LIB_DIR   = ../../libs/temporal-client
-CERTS_DIR = $(shell pwd)/certs
-T_HOST    = localhost:7233
-T_NS      = default
-T_TLS_ENV = TEMPORAL_TLS_CA=$(CERTS_DIR)/ca.crt \
-            TEMPORAL_TLS_CERT=$(CERTS_DIR)/dev-client.crt \
-            TEMPORAL_TLS_KEY=$(CERTS_DIR)/dev-client.key
+COMPOSE     = podman compose
+VM_DIR      = ../../services/vm-requests
+BUCKET_DIR  = ../../services/bucket-requests
+CERTS_DIR   = $(shell pwd)/certs
+T_HOST      = localhost:7233
+T_NS        = default
+T_TLS_ENV   = TEMPORAL_TLS_CA=$(CERTS_DIR)/ca.crt \
+              TEMPORAL_TLS_CERT=$(CERTS_DIR)/dev-client.crt \
+              TEMPORAL_TLS_KEY=$(CERTS_DIR)/dev-client.key
 
 .DEFAULT_GOAL := help
 
 .PHONY: help up down reset logs ps ui \
         certs issue-cert \
-        example-worker example-start example-approve example-reject example-result
+        vm-worker vm-start vm-approve vm-reject vm-result \
+        bucket-worker bucket-start bucket-approve bucket-reject bucket-status
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-	  awk 'BEGIN {FS = ":.*?## "}; {printf "  %-22s %s\n", $$1, $$2}'
+	  awk 'BEGIN {FS = ":.*?## "}; {printf "  %-24s %s\n", $$1, $$2}'
 
 ## Stack
 up: ## Start Temporal stack (detached)
@@ -40,30 +42,54 @@ ui: ## Open Temporal UI in browser
 certs: ## Generate local dev CA, server cert, and dev-client cert (run once)
 	./scripts/gen-certs.sh dev-client
 
-issue-cert: ## Issue a cert for a new service  (make issue-cert SVC=svc-orders)
+issue-cert: ## Issue a cert for a new service  (make issue-cert SVC=svc-name)
 	@test -n "$(SVC)" || (echo "Usage: make issue-cert SVC=<service-name>"; exit 1)
 	./scripts/gen-certs.sh $(SVC)
 
-## Example workflow (requires: make up && make example-worker in a separate terminal)
-example-worker: ## Run the example order workflow worker
-	cd $(LIB_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run python -m temporal_client.examples.worker
+## VM requests service (worker only — requires: make up && make vm-worker in a separate terminal)
+vm-worker: ## Run the vm-requests worker
+	cd $(VM_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
+	  uv run python -m vm_requests.worker
 
-example-start: ## Start a new order workflow
-	cd $(LIB_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run python -m temporal_client.examples.starter start
+vm-start: ## Submit a new VM request
+	cd $(VM_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
+	  uv run python -m vm_requests.starter start
 
-example-approve: ## Approve a workflow  (make example-approve ID=order-ORD-XXXXXXXX)
-	@test -n "$(ID)" || (echo "Usage: make example-approve ID=<workflow-id>"; exit 1)
-	cd $(LIB_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run python -m temporal_client.examples.starter approve $(ID)
+vm-approve: ## Approve a VM request  (make vm-approve ID=<workflow-id>)
+	@test -n "$(ID)" || (echo "Usage: make vm-approve ID=<workflow-id>"; exit 1)
+	cd $(VM_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
+	  uv run python -m vm_requests.starter approve $(ID)
 
-example-reject: ## Reject a workflow   (make example-reject ID=order-ORD-XXXXXXXX)
-	@test -n "$(ID)" || (echo "Usage: make example-reject ID=<workflow-id>"; exit 1)
-	cd $(LIB_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run python -m temporal_client.examples.starter reject $(ID)
+vm-reject: ## Reject a VM request   (make vm-reject ID=<workflow-id>)
+	@test -n "$(ID)" || (echo "Usage: make vm-reject ID=<workflow-id>"; exit 1)
+	cd $(VM_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
+	  uv run python -m vm_requests.starter reject $(ID)
 
-example-result: ## Fetch workflow result (make example-result ID=order-ORD-XXXXXXXX)
-	@test -n "$(ID)" || (echo "Usage: make example-result ID=<workflow-id>"; exit 1)
-	cd $(LIB_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run python -m temporal_client.examples.starter result $(ID)
+vm-result: ## Fetch VM request result (make vm-result ID=<workflow-id>)
+	@test -n "$(ID)" || (echo "Usage: make vm-result ID=<workflow-id>"; exit 1)
+	cd $(VM_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
+	  uv run python -m vm_requests.starter result $(ID)
+
+## Bucket requests service (API + worker — requires: make up && make bucket-worker + bucket-api)
+bucket-worker: ## Run the bucket-requests worker
+	cd $(BUCKET_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
+	  uv run python -m bucket_requests.worker
+
+bucket-api: ## Run the bucket-requests API (http://localhost:8002)
+	cd $(BUCKET_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
+	  uv run uvicorn bucket_requests.api:app --reload --port 8002
+
+bucket-start: ## Submit a new bucket request (requires bucket-api running)
+	cd $(BUCKET_DIR) && $(MAKE) create-request
+
+bucket-approve: ## Approve a bucket request  (make bucket-approve ID=<request_id>)
+	@test -n "$(ID)" || (echo "Usage: make bucket-approve ID=<request_id>"; exit 1)
+	cd $(BUCKET_DIR) && $(MAKE) approve ID=$(ID)
+
+bucket-reject: ## Reject a bucket request   (make bucket-reject ID=<request_id>)
+	@test -n "$(ID)" || (echo "Usage: make bucket-reject ID=<request_id>"; exit 1)
+	cd $(BUCKET_DIR) && $(MAKE) reject ID=$(ID)
+
+bucket-status: ## Get bucket request status  (make bucket-status ID=<request_id>)
+	@test -n "$(ID)" || (echo "Usage: make bucket-status ID=<request_id>"; exit 1)
+	cd $(BUCKET_DIR) && $(MAKE) status ID=$(ID)

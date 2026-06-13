@@ -31,13 +31,23 @@ Full Makefile reference: `make help`
 
 `libs/temporal-client` is an installable `uv`-managed Python package (`src/` layout, `hatchling` build backend).
 
-Services add it as a path dependency:
+Services add it as a workspace dependency. The root `pyproject.toml` declares workspace members, and each service references the lib by name:
 
 ```toml
+# services/<name>/pyproject.toml
 dependencies = [
-    "temporal-client @ file:../../libs/temporal-client",
+    "temporal-client",
+    ...
 ]
+
+[tool.uv.sources]
+temporal-client = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/<name>"]
 ```
+
+Then `uv sync` from the service directory resolves `temporal-client` from `libs/temporal-client` automatically.
 
 Usage:
 

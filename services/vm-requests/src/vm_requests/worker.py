@@ -1,15 +1,16 @@
 """
-Run the example order workflow worker.
+VM requests Temporal worker.
 
-    TEMPORAL_HOST=localhost:7233 TEMPORAL_NAMESPACE=default uv run python -m temporal_client.examples.worker
+    cd services/vm-requests
+    TEMPORAL_HOST=localhost:7233 TEMPORAL_NAMESPACE=default uv run python -m vm_requests.worker
 """
 import asyncio
 import logging
 from temporal_client import get_client, build_worker
-from .activities import charge_payment, fulfill_order, release_inventory, reserve_inventory
-from .workflows import OrderWorkflow
+from .activities import send_confirmation_email, provision_vm, send_provisioned_email, send_rejection_email
+from .workflows import VMRequestWorkflow
 
-TASK_QUEUE = "order-queue"
+TASK_QUEUE = "vm-requests-queue"
 
 
 async def main() -> None:
@@ -21,8 +22,8 @@ async def main() -> None:
     worker = build_worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[OrderWorkflow],
-        activities=[reserve_inventory, release_inventory, charge_payment, fulfill_order],
+        workflows=[VMRequestWorkflow],
+        activities=[send_confirmation_email, provision_vm, send_provisioned_email, send_rejection_email],
     )
     print(f"Worker running — namespace: {client.namespace}  task queue: {TASK_QUEUE}")
     print("Press Ctrl+C to stop.")
