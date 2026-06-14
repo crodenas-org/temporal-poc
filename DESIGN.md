@@ -86,12 +86,11 @@ catalog_item:
     business_owner: dept-head@company.com
     cost_center: "CC-1042"
 
-  # Templates bound to this catalog item
+  # Templates — omit a key to use the platform generic; provide a name to override with a custom template
   templates:
-    chg: "tmpl-linux-vm-standard"
-    notification_submitted: "tmpl-notify-submitted"
-    notification_complete: "tmpl-notify-vm-ready"
-    notification_rejected: "tmpl-notify-rejected"
+    chg: "tmpl-linux-vm-standard"           # custom template registered before this catalog item
+    notification_complete: "tmpl-notify-vm-ready"   # custom
+    # notification_submitted and notification_rejected omitted — platform generics used
 
   # Approval policy
   approval:
@@ -142,10 +141,110 @@ catalog_item:
         widget: textarea
         condition: "inputs.environment == 'prod'"
 
-  # Reference to the workflow that delivers this item
-  workflow: linux-vm-provision
-  workflow_version: 3
+  # Workflow steps — embedded inline; not a separate registered resource
+  workflow:
+    steps:
+      - id: open_chg
+        type: create_chg
+        params:
+          template: "${catalog.templates.chg}"
+          title: "Provision Linux VM: ${inputs.hostname}"
+          environment: "${inputs.environment}"
+
+      - id: manager_approval
+        type: approval_gate
+        ref: "${catalog.approval.steps.manager_approval}"
+        params:
+          timeout: 48h
+          on_timeout: abandon
+
+      - id: security_approval
+        type: approval_gate
+        ref: "${catalog.approval.steps.security_approval}"
+        condition: "${inputs.environment == 'prod'}"
+        params:
+          timeout: 24h
+          on_timeout: abandon
+
+      - id: reserve_ip
+        type: service_call
+        params:
+          url: "${services.dns}/ip-reservations"
+          method: POST
+          body:
+            hostname: "${inputs.hostname}"
+            requester: "${request.requester_upn}"
+        compensation:
+          url: "${services.dns}/ip-reservations/${steps.reserve_ip.output.reservation_id}"
+          method: DELETE
+
+      - id: create_netgroup
+        type: service_call
+        params:
+          url: "${services.linux}/netgroups"
+          method: POST
+          body:
+            hostname: "${inputs.hostname}"
+        compensation:
+          url: "${services.linux}/netgroups/${steps.create_netgroup.output.netgroup_id}"
+          method: DELETE
+
+      - id: provision_vm
+        type: service_call
+        params:
+          url: "${services.linux}/vms"
+          method: POST
+          body:
+            hostname: "${inputs.hostname}"
+            size: "${inputs.size}"
+            disk_gb: "${inputs.disk_gb}"
+            ip: "${steps.reserve_ip.output.ip_address}"
+            netgroup: "${steps.create_netgroup.output.netgroup_id}"
+            tags:
+              cost_center: "${request.cost_center}"
+              owner: "${request.requester_upn}"
+              department: "${request.department}"
+        compensation:
+          url: "${services.linux}/vms/${steps.provision_vm.output.vm_id}"
+          method: DELETE
+
+      - id: close_chg
+        type: close_chg
+        params:
+          chg_id: "${steps.open_chg.output.chg_id}"
+          resolution: "Provisioning completed successfully"
+
+      - id: notify_complete
+        type: send_notification
+        params:
+          template: "${catalog.templates.notification_complete}"
+          to: "${request.requester_upn}"
+          data:
+            hostname: "${inputs.hostname}"
+            ip: "${steps.reserve_ip.output.ip_address}"
+            vm_id: "${steps.provision_vm.output.vm_id}"
+
+    on_failure:
+      - type: create_incident
+        params:
+          title: "VM provision failed: ${inputs.hostname}"
+          linked_chg: "${steps.open_chg.output.chg_id}"
+          assignment_group: "${catalog.ownership.technical_contact}"
+      - type: wait_for_incident_resolution
+        params:
+          timeout: 72h
+          on_timeout: abandon
 ```
+
+### Templates
+
+The orchestration service ships a set of **platform generic templates** covering common notifications and change records. These are available to all catalog items at no cost to the author — if a template key is omitted from the catalog item, the platform generic is used.
+
+When the generic content is not appropriate, the workflow author registers a **custom template** via the authoring API before submitting the catalog item. Custom templates are scoped to the author's catalog item — they are not shared with or reused by other catalog items. The catalog item references the custom template by the name the author assigned at registration.
+
+A catalog item can mix: use the platform generic for some template slots, override others with a custom template.
+
+---
 
 ### Standard platform fields
 
@@ -162,7 +261,7 @@ Collected on every request regardless of catalog item. Pre-populated where possi
 
 ### Publish-time validation
 
-When a catalog item is published the orchestration service validates the workflow definition before accepting it. Template requirements are derived automatically — the service parses the workflow steps, extracts every `${catalog.templates.*}` expression, and verifies each referenced template exists and is registered. The workflow author does not declare a template list separately; the workflow itself is the source of truth for what is needed.
+When a catalog item is published the orchestration service validates the full payload before accepting it. The service parses the embedded workflow steps, extracts every `${catalog.templates.*}` expression, and verifies each named template exists — either as a platform generic or as a custom template the author has already registered. All pieces must be present before the catalog item can be published.
 
 Additional checks at publish time:
 - All step types are known primitives or resolvable service endpoints
@@ -177,111 +276,15 @@ Publication is rejected if any check fails. Missing templates and broken express
 - Authors work in `draft` status until ready to publish
 - Publishing increments the version and sets status to `published`
 - A previous version can be restored as the active version; only one version is ever active
-- In-flight requests always complete on the version they were triggered against — the orchestration service stores a snapshot of the catalog item and workflow definition at trigger time, not a pointer to current
+- In-flight requests always complete on the version they were triggered against — the orchestration service stores a snapshot of the full catalog item payload (including embedded workflow steps) at trigger time, not a pointer to current
 
 ---
 
-## 5. Workflow Definition Format
+## 5. Workflow Step Format
 
-Workflow definitions are authored in YAML and registered via the orchestration API. They are versioned independently of the catalog item that references them.
+Workflow steps are embedded directly in the catalog item payload under the `workflow.steps` key. They are not a separate registered resource. The full catalog item — metadata, inputs, approval policy, templates, and steps — is submitted and versioned as one unit.
 
-```yaml
-name: linux-vm-provision
-version: 3
-description: "Full lifecycle delivery of a Linux VM"
-
-steps:
-  - id: open_chg
-    type: create_chg
-    params:
-      template: "${catalog.templates.chg}"
-      title: "Provision Linux VM: ${inputs.hostname}"
-      environment: "${inputs.environment}"
-
-  - id: manager_approval
-    type: approval_gate
-    ref: "${catalog.approval.steps.manager_approval}"
-    params:
-      timeout: 48h
-      on_timeout: abandon
-
-  - id: security_approval
-    type: approval_gate
-    ref: "${catalog.approval.steps.security_approval}"
-    condition: "${inputs.environment == 'prod'}"
-    params:
-      timeout: 24h
-      on_timeout: abandon
-
-  - id: reserve_ip
-    type: service_call
-    params:
-      url: "${services.dns}/ip-reservations"
-      method: POST
-      body:
-        hostname: "${inputs.hostname}"
-        requester: "${request.requester_upn}"
-    compensation:
-      url: "${services.dns}/ip-reservations/${steps.reserve_ip.output.reservation_id}"
-      method: DELETE
-
-  - id: create_netgroup
-    type: service_call
-    params:
-      url: "${services.linux}/netgroups"
-      method: POST
-      body:
-        hostname: "${inputs.hostname}"
-    compensation:
-      url: "${services.linux}/netgroups/${steps.create_netgroup.output.netgroup_id}"
-      method: DELETE
-
-  - id: provision_vm
-    type: service_call
-    params:
-      url: "${services.linux}/vms"
-      method: POST
-      body:
-        hostname: "${inputs.hostname}"
-        size: "${inputs.size}"
-        disk_gb: "${inputs.disk_gb}"
-        ip: "${steps.reserve_ip.output.ip_address}"
-        netgroup: "${steps.create_netgroup.output.netgroup_id}"
-        tags:
-          cost_center: "${request.cost_center}"
-          owner: "${request.requester_upn}"
-          department: "${request.department}"
-    compensation:
-      url: "${services.linux}/vms/${steps.provision_vm.output.vm_id}"
-      method: DELETE
-
-  - id: close_chg
-    type: close_chg
-    params:
-      chg_id: "${steps.open_chg.output.chg_id}"
-      resolution: "Provisioning completed successfully"
-
-  - id: notify_complete
-    type: send_notification
-    params:
-      template: "${catalog.templates.notification_complete}"
-      to: "${request.requester_upn}"
-      data:
-        hostname: "${inputs.hostname}"
-        ip: "${steps.reserve_ip.output.ip_address}"
-        vm_id: "${steps.provision_vm.output.vm_id}"
-
-on_failure:
-  - type: create_incident
-    params:
-      title: "VM provision failed: ${inputs.hostname}"
-      linked_chg: "${steps.open_chg.output.chg_id}"
-      assignment_group: "${catalog.ownership.technical_contact}"
-  - type: wait_for_incident_resolution
-    params:
-      timeout: 72h
-      on_timeout: abandon
-```
+The complete example is shown in §4. This section documents the expression syntax and available step types.
 
 ### Expression syntax
 
@@ -612,13 +615,12 @@ GET  /approvals/pending                 all approval gates pending the caller's 
 ### Authoring API (workflow author surface)
 ```
 GET    /definitions/catalog-items                      list all catalog items the caller owns
-POST   /definitions/catalog-items                      register or update a catalog item (draft)
+POST   /definitions/catalog-items                      register or update a catalog item (draft; workflow steps included in payload)
 POST   /definitions/catalog-items/{id}/publish         publish current draft
 POST   /definitions/catalog-items/{id}/rollback        restore previous published version
-GET    /definitions/workflows                           list workflow definitions
-POST   /definitions/workflows                          register or update a workflow definition
-GET    /definitions/templates                           list available templates
-POST   /definitions/templates                          register a template
+
+GET    /definitions/templates                           list available templates (platform generics + caller's custom templates)
+POST   /definitions/templates                          register a custom template (must exist before referencing catalog item is published)
 
 GET    /definitions/catalog-items/{id}/validate        validate definition against schema
 ```
