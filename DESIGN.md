@@ -99,7 +99,7 @@ catalog_item:
       - id: manager_approval
         type: serial
         approvers:
-          - type: person
+          - type: resolver
             resolver: manager_of_requester
       - id: security_approval
         type: parallel
@@ -107,6 +107,8 @@ catalog_item:
         approvers:
           - type: group
             id: "DL-Security-Approvers"
+      - id: cost_approval
+        policy: cost_approval             # platform-level named policy; opt-in per catalog item
 
   # Input schema — drives dynamic form generation
   inputs:
@@ -157,6 +159,17 @@ Collected on every request regardless of catalog item. Pre-populated where possi
 | `department` | Entra profile attribute |
 | `manager_upn` | Entra profile / Graph API |
 | `submitted_at` | Platform, at trigger time |
+
+### Publish-time validation
+
+When a catalog item is published the orchestration service validates the workflow definition before accepting it. Template requirements are derived automatically — the service parses the workflow steps, extracts every `${catalog.templates.*}` expression, and verifies each referenced template exists and is registered. The workflow author does not declare a template list separately; the workflow itself is the source of truth for what is needed.
+
+Additional checks at publish time:
+- All step types are known primitives or resolvable service endpoints
+- All `${inputs.*}` and `${steps.*}` expressions reference fields and steps that exist in the definition
+- Approval group IDs and resolver types are valid
+
+Publication is rejected if any check fails. Missing templates and broken expressions are caught before the catalog item is ever visible to end users.
 
 ### Versioning
 
@@ -351,10 +364,11 @@ Pauses the workflow for a fixed duration or until a datetime. Useful for schedul
 | `person` | Named individual by UPN |
 | `group` | AD group; any member may approve |
 | `resolver` | Orchestration-resolved identity (e.g. `manager_of_requester`) |
+| `input` | Requester-selected individual; UPN provided via form field at submit time |
 
 ### Approval structure
 
-Approval steps are declared on the catalog item and referenced by workflow steps. A catalog item may have multiple approval steps executed in the sequence defined by the workflow.
+Approval steps are declared on the catalog item and referenced by workflow steps. A catalog item may have multiple approval steps executed in the sequence defined by the workflow. The catalog item controls the ordering of all steps, including named platform policies.
 
 **Serial** — approvers are notified in order. Each must act before the next receives notification.
 
@@ -362,9 +376,62 @@ Approval steps are declared on the catalog item and referenced by workflow steps
 
 **Conditional** — the entire approval step is skipped if the condition evaluates false at trigger time.
 
+### Named approval policies
+
+The orchestration service defines platform-level approval policies for org-wide concerns. Catalog items opt in by referencing a policy by name. Not all catalog items are required to include any given policy.
+
+When a catalog item references a named policy, the orchestration service automatically injects the policy's required input fields into the request form — the workflow author does not declare them. The policy owns the field definitions.
+
+**`cost_approval`** — requires the requester to select a named cost approver at submit time. The selected person receives a notification and must approve before the workflow proceeds. This policy always involves a specific individual; there is no group or DL fallback.
+
+```yaml
+# catalog item opts in — ordering relative to other steps is author-controlled
+approval:
+  steps:
+    - id: manager_approval
+      type: serial
+      approvers:
+        - type: resolver
+          resolver: manager_of_requester
+
+    - id: cost_approval
+      policy: cost_approval       # injects cost_approver person-picker field into the form
+```
+
+The injected `cost_approver` field uses a `person_picker` UI widget so frontends render a directory search rather than free text. Any person in the directory is a valid selection — there is no role or group restriction. The value is validated as a known directory UPN before the request is accepted.
+
+For custom inline approval steps that use `type: input`, the workflow author may declare a `source` on the UI hint to restrict the picker to a list provided by the service team's own API. When `source` is absent the platform directory is used. When `source` is present the frontend populates the picker from that endpoint, and the platform validates the submitted UPN against the same endpoint at submit time — preventing a caller from bypassing the picker with an arbitrary UPN.
+
+```yaml
+# custom inline approval with a service-provided approver list
+inputs:
+  schema:
+    properties:
+      technical_approver:
+        type: string
+        title: "Technical Approver"
+        format: upn
+  ui:
+    technical_approver:
+      widget: person_picker
+      source: "${services.linux}/approvers"   # service-provided list; omit for full directory
+
+approval:
+  steps:
+    - id: technical_approval
+      type: serial
+      approvers:
+        - type: input
+          field: inputs.technical_approver
+```
+
+The approval step references the input field the same way regardless of where the list originates — the `source` is a concern of the form rendering and validation layer, not the approval gate itself.
+
+Named policies support a `pre_approved_if` condition (not yet defined) that, when true at trigger time, bypasses the approval gate entirely. The criteria for pre-approval of cost requests have not been determined.
+
 ### Self-approval
 
-**Open design question.** When the resolved approver identity matches the requester identity, the correct behavior is not yet defined. Escalation rules, secondary approver requirements, and policy ownership (platform-enforced vs workflow-author-declared) need further design. This is a known gap and will be addressed before the approval gate primitive is built.
+**Open design question.** When the resolved approver identity matches the requester identity, the correct behavior is not yet defined. This is a concrete scenario for `cost_approval` — a requester could enter their own UPN as the cost approver. Escalation rules, secondary approver requirements, and whether enforcement is platform-level or policy-level require further design. This must be resolved before the approval gate primitive is built.
 
 ### Notification
 
@@ -556,9 +623,19 @@ POST   /definitions/templates                          register a template
 GET    /definitions/catalog-items/{id}/validate        validate definition against schema
 ```
 
+### Reference API (form data surface)
+```
+GET  /reference/people?q={query}        directory person search; used by person_picker fields
+GET  /reference/groups?q={query}        AD group search
+```
+
+Reference endpoints are read-only lookups that populate dynamic form fields. They are called by the frontend at form render time, not at request submit time. Access is gated by the user's Entra token — no elevated permissions are used. Additional reference endpoints are added here as platform-level named policies require them.
+
 ### Dynamic form contract
 
 `GET /catalog/{item_id}/schema` returns a JSON Schema document plus UI hints. Any frontend that can render JSON Schema can generate a functional, validated form for any catalog item without custom code. Hosting platform standard fields (cost center, department) are pre-populated from the Entra token by the API — the form schema only includes fields the requester must explicitly provide.
+
+UI hints may include a `source` URL on `person_picker` and other dynamic fields. When `source` points to `/reference/*` the orchestration API serves the list. When `source` points to a service team endpoint (e.g. `${services.linux}/approvers`) the frontend calls that service directly. The frontend treats `source` as an opaque URL in both cases.
 
 ---
 
@@ -578,6 +655,19 @@ The hosting platform provides shared core Python libraries available to all serv
 | `platform-db` | Database connection factory |
 
 All libraries support BYOC — the caller supplies a secret reference and the lib resolves it from Secrets Manager at call time. When the orchestration service calls these libs as primitive activities it supplies orchestration-scoped secret references. When a team calls these libs from their own service they supply their own secret references scoped to their task role.
+
+### Reference endpoint convention
+
+Any service in the monorepo that defines catalog items with dynamic form fields owns the reference endpoints that back those fields. These are standard read-only API endpoints on the service — there is nothing orchestration-specific about them beyond the fact that their URLs appear in `source` fields in catalog item UI hints.
+
+Platform convention for reference endpoints:
+
+- Read-only, no side effects
+- Accept a `q` query parameter for search/filter where the field is a picker
+- Return a JSON array: `[{ "value": "<upn or id>", "label": "<display name>" }]`
+- Gated by the service's normal Entra token validation — the user's token, not an elevated service token
+
+The orchestration API's `/reference/*` endpoints follow this same convention. A service team implementing their own reference endpoints (e.g. `GET /approvers?q=`) should match this shape so any frontend consuming the dynamic form contract handles all `source` URLs uniformly.
 
 ---
 
@@ -638,7 +728,9 @@ This is straightforward to build once the YAML format is stable and the MCP serv
 
 ## 15. Open Design Questions
 
-**Self-approval** — when the resolved approver identity matches the requester identity, behavior is undefined. Escalation rules, secondary approver policy, and whether this is platform-enforced or workflow-author-declared require further design.
+**Self-approval** — when the resolved approver identity matches the requester identity, behavior is undefined. Most concrete for `cost_approval` where the requester selects the approver directly. Escalation rules, secondary approver policy, and whether this is platform-enforced or policy-level require further design.
+
+**Named policy pre-approval criteria** — `cost_approval` and future named policies will support a `pre_approved_if` condition that bypasses the gate when true at trigger time. The conditions for cost pre-approval have not been defined.
 
 **Rollback completeness** — compensation activities cover the happy-path undo case. Partial failures mid-compensation (compensation step itself fails) and workflows where some steps have no meaningful compensation need defined handling.
 
