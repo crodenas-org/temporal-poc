@@ -167,7 +167,7 @@ catalog_item:
           on_timeout: abandon
 
       - id: reserve_ip
-        type: service_call
+        type: api_call
         params:
           url: "${services.dns}/ip-reservations"
           method: POST
@@ -179,7 +179,7 @@ catalog_item:
           method: DELETE
 
       - id: create_netgroup
-        type: service_call
+        type: api_call
         params:
           url: "${services.linux}/netgroups"
           method: POST
@@ -190,7 +190,7 @@ catalog_item:
           method: DELETE
 
       - id: provision_vm
-        type: service_call
+        type: api_call
         params:
           url: "${services.linux}/vms"
           method: POST
@@ -303,7 +303,7 @@ Steps reference prior outputs and request context via `${}` expressions:
 | `update_chg` | Adds a work note or progress comment to an open CHG mid-workflow |
 | `close_chg` | Closes a change record with an outcome (success, cancelled, failed) |
 | `approval_gate` | Suspends execution, notifies approvers, resumes on signal |
-| `service_call` | Authenticated HTTP call to a team provisioning API |
+| `api_call` | Authenticated HTTP call to any internal service endpoint |
 | `send_notification` | Email or messaging notification using a template |
 | `create_incident` | Creates an INC in the ITSM system |
 | `wait_for_incident_resolution` | Polls INC status, resumes workflow when INC is closed |
@@ -344,8 +344,8 @@ Polls the INC until it reaches a resolved/closed state, then automatically signa
 ### `send_notification`
 Sends email or messaging notifications using a template defined in the catalog item. Executed using orchestration service credentials. Template data is populated from request context and step outputs.
 
-### `service_call`
-Authenticated HTTP call to a team provisioning API. The orchestration service calls using its Entra app identity — the target service must have granted API permission to the orchestration app registration. The originating requester's UPN is passed in the request payload as metadata, not as an auth token.
+### `api_call`
+Authenticated HTTP call to any internal service endpoint — provisioning, lookups, status checks, or any other operation the workflow needs. The orchestration service calls using its Entra app identity — the target service must have granted API permission to the orchestration app registration. The originating requester's UPN is passed in the request payload as metadata, not as an auth token.
 
 ### `condition`
 Evaluates an expression against input fields or prior step outputs and branches the workflow. Supports simple field comparisons at definition time; runtime expression evaluation against step outputs.
@@ -532,7 +532,7 @@ API permissions held by orchestration app registration:
   ...
 ```
 
-The `service_call` primitive acquires a token scoped to the target service's app ID. The role is already embedded in what was granted — no per-call role selection needed. The call either succeeds or returns 403.
+The `api_call` primitive acquires a token scoped to the target service's app ID. The role is already embedded in what was granted — no per-call role selection needed. The call either succeeds or returns 403.
 
 **Governance:** each team explicitly assigns the orchestration app registration their role in their Entra app manifest. That assignment is the team's consent to allow orchestration to call their service. It is auditable, revocable, and owned by the team.
 
@@ -746,5 +746,5 @@ This is straightforward to build once the YAML format is stable and the MCP serv
 - **BFF adapter** — an optional facade between a specific frontend and the orchestration API. Independent of the API itself.
 - **Metrics and analytics** — request volume, approval SLA tracking, step failure rates, catalog item usage. The data model supports it; the reporting surface is deferred.
 - **Scheduled workflows** — catalog items triggered on a schedule rather than by a requester. The Temporal infrastructure supports it; the authoring model for it is deferred.
-- **Cross-team Temporal child workflows** — one team's workflow directly invoking another team's Temporal workflow as a child workflow. Cross-team composition is supported via `service_call` to the owning team's API, which is the correct pattern and preserves credential and ownership boundaries.
+- **Cross-team Temporal child workflows** — one team's workflow directly invoking another team's Temporal workflow as a child workflow. Cross-team composition is supported via `api_call` to the owning team's API, which is the correct pattern and preserves credential and ownership boundaries.
 - **External webhook triggers** — initiating a request from an external event source.
