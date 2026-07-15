@@ -1,11 +1,12 @@
 [project]
-name = "svc-bucket-requests"
+name = "svc-waas"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "temporal-client",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
+    "httpx>=0.27.0",
 ]
 
 [tool.uv]
@@ -15,7 +16,7 @@ package = true
 temporal-client = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/bucket_requests"]
+packages = ["src/waas"]
 
 [build-system]
 requires = ["hatchling"]

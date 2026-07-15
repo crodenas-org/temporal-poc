@@ -1,0 +1,18 @@
+[project]
+name = "svc-compute"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+]
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/compute_svc"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

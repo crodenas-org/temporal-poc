@@ -26,23 +26,10 @@ services:
       POSTGRES_PWD: temporal
       POSTGRES_SEEDS: postgresql
       DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
-      # mTLS — only active when certs/ directory is populated (run: make certs)
-      # Frontend (external clients/workers → Temporal server)
-      TEMPORAL_TLS_FRONTEND_CERT: /etc/temporal/certs/server.crt
-      TEMPORAL_TLS_FRONTEND_KEY: /etc/temporal/certs/server.key
-      TEMPORAL_TLS_CLIENT1_CA_CERT: /etc/temporal/certs/ca.crt
-      TEMPORAL_TLS_REQUIRE_CLIENT_AUTH: "true"
-      # Internode (Temporal internal services → each other)
-      TEMPORAL_TLS_SERVER_CERT: /etc/temporal/certs/server.crt
-      TEMPORAL_TLS_SERVER_KEY: /etc/temporal/certs/server.key
-      TEMPORAL_TLS_SERVER_CA_CERT: /etc/temporal/certs/ca.crt
-      TEMPORAL_TLS_FRONTEND_SERVER_NAME: temporal
-      TEMPORAL_TLS_INTERNODE_SERVER_NAME: temporal
-      # auto-setup CLI (the setup script connects to the server it just started)
-      TEMPORAL_TLS_CA: /etc/temporal/certs/ca.crt
-      TEMPORAL_TLS_CERT: /etc/temporal/certs/server.crt
-      TEMPORAL_TLS_KEY: /etc/temporal/certs/server.key
-      TEMPORAL_TLS_SERVER_NAME: temporal
+      # mTLS DISABLED for local dev (2026-07-14) — server runs plaintext gRPC so
+      # host workers/clients connect without certs. To re-enable, restore the
+      # TEMPORAL_TLS_* block from git history and reconnect clients with the
+      # TEMPORAL_TLS_CA/CERT/KEY env vars (+ server-name override "temporal").
     volumes:
       - ./dynamicconfig:/etc/temporal/config/dynamicconfig
       - ./certs:/etc/temporal/certs:ro
@@ -57,10 +44,7 @@ services:
     environment:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_CORS_ORIGINS: http://localhost:3000
-      # mTLS client cert for UI → Temporal server connection
-      TEMPORAL_TLS_CA: /etc/temporal/certs/ca.crt
-      TEMPORAL_TLS_CERT: /etc/temporal/certs/temporal-ui.crt
-      TEMPORAL_TLS_KEY: /etc/temporal/certs/temporal-ui.key
+      # mTLS client certs removed for local dev — UI connects to plaintext server
     volumes:
       - ./certs:/etc/temporal/certs:ro
     ports:

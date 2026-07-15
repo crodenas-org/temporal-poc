@@ -1,19 +1,21 @@
 COMPOSE     = podman compose
-VM_DIR      = ../../services/vm-requests
-BUCKET_DIR  = ../../services/bucket-requests
+WAAS_DIR    = ../../services/waas
+DNS_DIR     = ../../services/dns-svc
+COMPUTE_DIR = ../../services/compute-svc
 CERTS_DIR   = $(shell pwd)/certs
 T_HOST      = localhost:7233
 T_NS        = default
-T_TLS_ENV   = TEMPORAL_TLS_CA=$(CERTS_DIR)/ca.crt \
-              TEMPORAL_TLS_CERT=$(CERTS_DIR)/dev-client.crt \
-              TEMPORAL_TLS_KEY=$(CERTS_DIR)/dev-client.key
+# mTLS disabled for local dev — leave T_TLS_ENV empty so workers connect plaintext.
+# Restore the TEMPORAL_TLS_* assignments below (and the block in compose.yml) to re-enable.
+T_TLS_ENV   =
+T_ENV       = TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV)
 
 .DEFAULT_GOAL := help
 
 .PHONY: help up down reset logs ps ui \
         certs issue-cert \
-        vm-worker vm-start vm-approve vm-reject vm-result \
-        bucket-worker bucket-start bucket-approve bucket-reject bucket-status
+        dns-svc compute-svc waas-worker waas-api \
+        create-request approve status
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -46,50 +48,27 @@ issue-cert: ## Issue a cert for a new service  (make issue-cert SVC=svc-name)
 	@test -n "$(SVC)" || (echo "Usage: make issue-cert SVC=<service-name>"; exit 1)
 	./scripts/gen-certs.sh $(SVC)
 
-## VM requests service (worker only — requires: make up && make vm-worker in a separate terminal)
-vm-worker: ## Run the vm-requests worker
-	cd $(VM_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run python -m vm_requests.worker
+## Domain services (each owns its own logic; WaaS calls them via api_call)
+dns-svc: ## Run the DNS domain service (http://localhost:8010)
+	cd $(DNS_DIR) && uv run uvicorn dns_svc.api:app --reload --port 8010
 
-vm-start: ## Submit a new VM request
-	cd $(VM_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run python -m vm_requests.starter start
+compute-svc: ## Run the Compute domain service (http://localhost:8011)
+	cd $(COMPUTE_DIR) && uv run uvicorn compute_svc.api:app --reload --port 8011
 
-vm-approve: ## Approve a VM request  (make vm-approve ID=<workflow-id>)
-	@test -n "$(ID)" || (echo "Usage: make vm-approve ID=<workflow-id>"; exit 1)
-	cd $(VM_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run python -m vm_requests.starter approve $(ID)
+## WaaS orchestrator (requires: make up + dns-svc + compute-svc running)
+waas-worker: ## Run the WaaS worker
+	cd $(WAAS_DIR) && $(T_ENV) uv run python -m waas.worker
 
-vm-reject: ## Reject a VM request   (make vm-reject ID=<workflow-id>)
-	@test -n "$(ID)" || (echo "Usage: make vm-reject ID=<workflow-id>"; exit 1)
-	cd $(VM_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run python -m vm_requests.starter reject $(ID)
+waas-api: ## Run the WaaS API (http://localhost:8004)
+	cd $(WAAS_DIR) && $(T_ENV) uv run uvicorn waas.api:app --reload --port 8004
 
-vm-result: ## Fetch VM request result (make vm-result ID=<workflow-id>)
-	@test -n "$(ID)" || (echo "Usage: make vm-result ID=<workflow-id>"; exit 1)
-	cd $(VM_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run python -m vm_requests.starter result $(ID)
+create-request: ## Submit a request against the 'linux-vm' catalog item
+	cd $(WAAS_DIR) && $(MAKE) create-request
 
-## Bucket requests service (API + worker — requires: make up && make bucket-worker + bucket-api)
-bucket-worker: ## Run the bucket-requests worker
-	cd $(BUCKET_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run python -m bucket_requests.worker
+approve: ## Approve a request's gate  (make approve ID=<request_id>)
+	@test -n "$(ID)" || (echo "Usage: make approve ID=<request_id>"; exit 1)
+	cd $(WAAS_DIR) && $(MAKE) approve ID=$(ID)
 
-bucket-api: ## Run the bucket-requests API (http://localhost:8002)
-	cd $(BUCKET_DIR) && TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV) \
-	  uv run uvicorn bucket_requests.api:app --reload --port 8002
-
-bucket-start: ## Submit a new bucket request (requires bucket-api running)
-	cd $(BUCKET_DIR) && $(MAKE) create-request
-
-bucket-approve: ## Approve a bucket request  (make bucket-approve ID=<request_id>)
-	@test -n "$(ID)" || (echo "Usage: make bucket-approve ID=<request_id>"; exit 1)
-	cd $(BUCKET_DIR) && $(MAKE) approve ID=$(ID)
-
-bucket-reject: ## Reject a bucket request   (make bucket-reject ID=<request_id>)
-	@test -n "$(ID)" || (echo "Usage: make bucket-reject ID=<request_id>"; exit 1)
-	cd $(BUCKET_DIR) && $(MAKE) reject ID=$(ID)
-
-bucket-status: ## Get bucket request status  (make bucket-status ID=<request_id>)
-	@test -n "$(ID)" || (echo "Usage: make bucket-status ID=<request_id>"; exit 1)
-	cd $(BUCKET_DIR) && $(MAKE) status ID=$(ID)
+status: ## Get request status  (make status ID=<request_id>)
+	@test -n "$(ID)" || (echo "Usage: make status ID=<request_id>"; exit 1)
+	cd $(WAAS_DIR) && $(MAKE) status ID=$(ID)
