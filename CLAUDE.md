@@ -19,11 +19,12 @@ Read `DESIGN.md` for the full platform vision, namespace isolation model, and wo
 
 ```bash
 cd infra/temporal
-make certs    # one-time: generate CA + server + dev-client certs (requires: brew install step)
 make up       # start Temporal + Postgres 18 + UI (~30s for auto-setup to finish)
 make ps       # verify all three containers are up
 make ui       # open http://localhost:8080
 ```
+
+mTLS is disabled locally (plaintext) — `make certs` is not needed unless you re-enable it (see mTLS below).
 
 Full Makefile reference: `make help`
 
@@ -75,13 +76,22 @@ await worker.run()
 libs/temporal-client/src/temporal_client/
 ├── config.py    — reads env vars, fails fast with clear error if required vars missing
 ├── client.py    — get_client() → Client; builds TLSConfig when cert vars are set
-├── worker.py    — build_worker() → Worker convenience wrapper
-└── examples/    — OrderWorkflow demo; use make example-worker / example-start to run
+└── worker.py    — build_worker() → Worker convenience wrapper
 ```
+
+The `services/` tree consumes this lib. `waas` is the Workflow-as-a-Service
+orchestrator (POC); `dns-svc` and `compute-svc` are domain services it calls over
+HTTP. Run the end-to-end demo via `make dns-svc / compute-svc / waas-worker /
+waas-api` from `infra/temporal/` — see `services/waas/README.md`.
 
 ## mTLS
 
-Local certs live in `infra/temporal/certs/` (gitignored). Generate with `make certs` (one-time) and issue per-service certs with `make issue-cert SVC=svc-name`. The `step` CLI is required (`brew install step`).
+**Disabled in local dev (2026-07-14)** — the local stack runs plaintext gRPC, so
+`make certs` is not required. To re-enable, restore the `TEMPORAL_TLS_*` block in
+`compose.yml` from git history and set the `TEMPORAL_TLS_CA/CERT/KEY` env vars on
+each client (server-name override `temporal`).
+
+When enabled: local certs live in `infra/temporal/certs/` (gitignored). Generate with `make certs` (one-time) and issue per-service certs with `make issue-cert SVC=svc-name`. The `step` CLI is required (`brew install step`).
 
 The client lib enables mTLS automatically when all three `TEMPORAL_TLS_*` env vars are set. No code changes needed between plaintext and mTLS — only env vars differ.
 
@@ -102,7 +112,7 @@ make issue-cert SVC=svc-orders   # from infra/temporal/
 
 - **Determinism**: no `datetime.now()`, `random`, or direct I/O inside `@workflow.defn` methods. Use `workflow.now()` and `workflow.unsafe.imports_passed_through()` for non-deterministic imports.
 - **Activity options**: always set `start_to_close_timeout` + `RetryPolicy` at the call site.
-- **Signals + wait**: use `@workflow.signal` + `workflow.wait_condition()` for human-in-the-loop steps. See `examples/workflows.py` for the pattern.
+- **Signals + wait**: use `@workflow.signal` + `workflow.wait_condition()` for human-in-the-loop steps. See `services/waas/src/waas/workflows.py` (approval gate) for the pattern.
 - **Task queues**: each service picks its own name — no central registry needed; namespace isolation prevents collisions.
 
 ## AWS Deployment (in progress)

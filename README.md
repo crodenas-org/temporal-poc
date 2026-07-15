@@ -22,8 +22,12 @@ libs/temporal-client/
 └── src/temporal_client/
     ├── client.py            # get_client() — connects using env vars, mTLS if certs present
     ├── config.py            # reads TEMPORAL_HOST, TEMPORAL_NAMESPACE, TEMPORAL_TLS_*
-    ├── worker.py            # build_worker() convenience wrapper
-    └── examples/            # OrderWorkflow demo — validates the full stack end-to-end
+    └── worker.py            # build_worker() convenience wrapper
+
+services/
+├── waas/                    # Workflow-as-a-Service orchestrator (POC) — see services/waas/README.md
+├── dns-svc/                 # domain service: POST /ip-reservations
+└── compute-svc/            # domain service: POST /vms
 ```
 
 ---
@@ -41,15 +45,14 @@ libs/temporal-client/
 ```bash
 cd infra/temporal
 
-# 1. Generate local CA, server cert, and dev-client cert
-make certs
-
-# 2. Start the stack (takes ~30s for auto-setup to initialize)
+# 1. Start the stack (takes ~30s for auto-setup to initialize)
 make up
 
-# 3. Verify
+# 2. Verify
 make ps
 ```
+
+> **Local dev runs plaintext** — mTLS is disabled in the local stack (see [mTLS](#mtls) below), so `make certs` is not required to get started. Run it only if you're re-enabling mTLS.
 
 Expected output from `make ps`:
 
@@ -76,21 +79,28 @@ make ps      # container status
 
 ---
 
-## Running the example workflow (smoke test)
+## Running the WaaS demo (smoke test)
 
-Requires the stack to be running. In two terminals from `infra/temporal/`:
+The `services/waas` orchestrator validates the full stack end-to-end: a durable
+`ProvisionWorkflow` with an approval gate that calls two domain services
+(`dns-svc`, `compute-svc`) over HTTP. Requires the Temporal stack running.
+
+From `infra/temporal/`, in separate terminals:
 
 ```bash
-# Terminal 1 — start the worker
-make example-worker
+make dns-svc          # domain service on :8010
+make compute-svc      # domain service on :8011
+make waas-worker      # WaaS worker — watch orchestration logs
+make waas-api         # WaaS API on :8004
 
-# Terminal 2 — trigger a workflow, copy the workflow ID
-make example-start
-
-# Approve or reject it
-make example-approve ID=order-ORD-XXXXXXXX
-make example-result  ID=order-ORD-XXXXXXXX
+# drive it
+make create-request         # submit against the 'linux-vm' catalog item -> request_id
+make approve ID=<request_id>
+make status  ID=<request_id>
 ```
+
+See [`services/waas/README.md`](services/waas/README.md) for the workflow shape
+and what each step does.
 
 ---
 
@@ -118,7 +128,9 @@ podman exec temporal-dev_temporal_1 \
 
 ## mTLS
 
-All connections to Temporal are mutually authenticated. Each service presents a client certificate signed by the shared CA. The server validates client certs; clients validate the server cert.
+> **Disabled in local dev (2026-07-14).** The local stack (`compose.yml` + `Makefile`) runs plaintext gRPC so host workers and clients connect without certs. The design below is the intended production posture and the re-enable target. To turn it back on locally, restore the `TEMPORAL_TLS_*` block in `compose.yml` from git history and set the `TEMPORAL_TLS_CA/CERT/KEY` env vars on each client (with server-name override `temporal`).
+
+When enabled, all connections to Temporal are mutually authenticated. Each service presents a client certificate signed by the shared CA. The server validates client certs; clients validate the server cert.
 
 ### Certificate layout
 
@@ -209,7 +221,7 @@ When dropping this into the monorepo:
 - [ ] Copy `infra/temporal/` → `infra/temporal/` in the monorepo
 - [ ] Copy `libs/temporal-client/` → `libs/temporal-client/` in the monorepo
 - [ ] Add `infra/temporal/certs/` to the monorepo's `.gitignore`
-- [ ] Each developer runs `make certs && make up` once after cloning
+- [ ] Each developer runs `make up` once after cloning (add `make certs` if mTLS is re-enabled)
 - [ ] First consuming service: add `temporal-client` as a path dependency, set the five env vars in its `.env`
 - [ ] Provision a namespace for each service: `make issue-cert SVC=svc-name` + `temporal operator namespace create`
 
