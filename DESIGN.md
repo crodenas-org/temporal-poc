@@ -730,7 +730,7 @@ This is straightforward to build once the YAML format is stable and the MCP serv
 
 ## 14. Implementation Status & Deferred Gaps
 
-A local POC exists under `services/`: `waas` (orchestrator) plus `dns-svc` and `compute-svc` (the trivial domain services it orchestrates). It proves the core model end to end — thin-payload requests (workflow carries only `request_id`), DB-authoritative inputs, edit-before-approval, an approval gate, and orchestration of domain services purely via the `api_call` primitive with no domain logic in WaaS.
+A local POC exists under `services/`: `waas` (orchestrator) plus `dns-svc` and `compute-svc` (the trivial domain services it orchestrates). It proves the core model end to end — thin-payload requests (workflow carries only `request_id`), DB-authoritative inputs, edit-before-approval, an approval gate, and orchestration of domain services purely via the `api_call` primitive with no domain logic in WaaS. It also demonstrates the `send_notification` platform primitive: a best-effort "awaiting approval" notice fires ahead of the gate, with delivery **simulated** (logged, not sent) and the recipient hardcoded/echoed from inputs rather than resolved from the approval policy.
 
 **Largest gap — the workflow step interpreter is not built.** §4/§5 describe workflows as *data*: a `workflow.steps` list interpreted at runtime. The POC instead **hardcodes each workflow in Python** (`waas/workflows.py::ProvisionWorkflow`). Every new offering therefore requires new Python, which contradicts the §1 promise that teams do not write orchestration code. The deferred piece is a single generic workflow that (1) loops the step list, (2) dispatches on `step.type` to the primitive library (§6), (3) resolves `${inputs.*}` / `${steps.<id>.output.*}` / `${services.*}` expressions (§5), and (4) accumulates step outputs into a runtime context. This interpreter is what turns WaaS from per-offering code into a data-driven platform; it is the central thing still to build.
 
@@ -739,6 +739,7 @@ Other POC deferrals (endpoint/model *shapes* are correct; internals are thin):
 - Freeze/cutoff + a `draft` request state for edit-before-approval (pending §8 amendment)
 - JSON Schema validation of request inputs against the catalog item (§4)
 - Entra token on `api_call`; end-user auth on the API (§9)
+- Real notification delivery (`send_notification` logs instead of sending) and recipient resolution from approver types; the approval-gate primitive that would own the approver notice is not yet built (§approval_gate)
 - Compensation execution (the domain `DELETE` hooks exist but are not wired)
 - Real Postgres (SQLite stands in) and the authoring API (§11)
 - mTLS disabled in the local stack for dev convenience — re-enable via `compose.yml` + client `TEMPORAL_TLS_*`

@@ -26,3 +26,18 @@ async def api_call(method: str, url: str, body: dict | None = None) -> dict:
         result = resp.json() if resp.content else {}
     activity.logger.info(f"api_call {method} {url} -> {result}")
     return result
+
+
+@activity.defn
+async def send_notification(recipient: str, subject: str, body: str) -> dict:
+    """Platform notification primitive (DESIGN.md §send_notification).
+
+    Orchestration-owned, not a domain service — it carries no business logic, only
+    delivery of template-rendered content using orchestration credentials. In
+    production this sends via SES / Graph sendMail; here delivery is SIMULATED by
+    logging the rendered message. Callers treat it as best-effort (non-fatal).
+    """
+    activity.logger.info(
+        "send_notification (SIMULATED) to=%s subject=%r\n%s", recipient, subject, body
+    )
+    return {"delivered": True, "recipient": recipient, "subject": subject}

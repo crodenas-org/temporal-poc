@@ -8,7 +8,7 @@ import logging
 
 from temporal_client import get_client, build_worker
 
-from .activities import load_inputs, api_call
+from .activities import load_inputs, api_call, send_notification
 from .store import init_db
 from .workflows import ProvisionWorkflow
 
@@ -26,7 +26,7 @@ async def main() -> None:
         client,
         task_queue=TASK_QUEUE,
         workflows=[ProvisionWorkflow],
-        activities=[load_inputs, api_call],
+        activities=[load_inputs, api_call, send_notification],
     )
     print(f"WaaS worker running — namespace: {client.namespace}  task queue: {TASK_QUEUE}")
     print("Press Ctrl+C to stop.")
