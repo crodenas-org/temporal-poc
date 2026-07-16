@@ -1,0 +1,2 @@
+# Compiled server binary from `go build` (named after the directory)
+/server-image

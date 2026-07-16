@@ -13,6 +13,7 @@ T_ENV       = TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV)
 .DEFAULT_GOAL := help
 
 .PHONY: help up down reset logs ps ui \
+        build rebuild namespace admin \
         certs issue-cert \
         dns-svc compute-svc waas-worker waas-api \
         create-request approve status
@@ -39,6 +40,20 @@ ps: ## Show Temporal container status
 
 ui: ## Open Temporal UI in browser
 	open http://localhost:8080
+
+## Custom server image
+build: ## Build the custom Temporal server image (first `up` builds it automatically)
+	$(COMPOSE) build temporal
+
+rebuild: ## Rebuild the custom server image from scratch (after changing the mapper)
+	$(COMPOSE) build --no-cache temporal
+
+namespace: ## Create a namespace via the admin sidecar  (make namespace NS=svc-name)
+	@test -n "$(NS)" || (echo "Usage: make namespace NS=<namespace>"; exit 1)
+	$(COMPOSE) exec temporal-admin bash /scripts/create-namespace.sh $(NS)
+
+admin: ## Open a shell in the admin-tools sidecar (temporal CLI lives here)
+	$(COMPOSE) exec temporal-admin bash
 
 ## Certificates
 certs: ## Generate local dev CA, server cert, and dev-client cert (run once)

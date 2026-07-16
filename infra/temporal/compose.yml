@@ -1,5 +1,10 @@
 name: temporal-dev
 
+# Local dev stack for the CUSTOM Temporal server image (RBAC-capable, auth OFF in
+# Phase 1). Replaces the single auto-setup container with: a one-shot schema
+# init, the custom server built from ./server-image, a one-shot default-namespace
+# creator, a long-lived admin/CLI sidecar, and the UI. See AUTHZ.md §5/§12.
+
 services:
   postgresql:
     image: docker.io/postgres:18
@@ -14,39 +19,85 @@ services:
       timeout: 5s
       retries: 10
 
-  temporal:
-    image: docker.io/temporalio/auto-setup:1.27
+  # One-shot: create databases + install schema, then exit. Replaces the
+  # schema-migration half of auto-setup.
+  temporal-schema:
+    image: docker.io/temporalio/admin-tools:1.27
     depends_on:
       postgresql:
         condition: service_healthy
     environment:
-      DB: postgres12
-      DB_PORT: "5432"
-      POSTGRES_USER: temporal
-      POSTGRES_PWD: temporal
-      POSTGRES_SEEDS: postgresql
-      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
-      # mTLS DISABLED for local dev (2026-07-14) — server runs plaintext gRPC so
-      # host workers/clients connect without certs. To re-enable, restore the
-      # TEMPORAL_TLS_* block from git history and reconnect clients with the
-      # TEMPORAL_TLS_CA/CERT/KEY env vars (+ server-name override "temporal").
+      SQL_PLUGIN: postgres12
+      SQL_HOST: postgresql
+      SQL_PORT: "5432"
+      SQL_USER: temporal
+      SQL_PASSWORD: temporal
     volumes:
-      - ./dynamicconfig:/etc/temporal/config/dynamicconfig
-      - ./certs:/etc/temporal/certs:ro
+      - ./scripts:/scripts:ro
+    # admin-tools ENTRYPOINT is `tini -- sleep infinity`, so override it to
+    # actually run our script instead of appending args to sleep.
+    entrypoint: ["bash"]
+    command: ["/scripts/setup-schema.sh"]
+    restart: "no"
+
+  # Custom server: standard Temporal + our compiled-in ClaimMapper, built locally
+  # from ./server-image. Authorization is OFF in Phase 1 (docker.yaml has no
+  # authorization block), so runtime behavior matches auto-setup.
+  temporal:
+    build:
+      context: ./server-image
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      temporal-schema:
+        condition: service_completed_successfully
+    environment:
+      TEMPORAL_CONFIG_DIR: /etc/temporal/config
+      TEMPORAL_ENVIRONMENT: docker
+    volumes:
+      - ./server-image/config:/etc/temporal/config:ro
+      - ./dynamicconfig:/etc/temporal/dynamicconfig:ro
     ports:
       - "7233:7233"
+    restart: unless-stopped
+
+  # One-shot: create the 'default' namespace once the server is reachable.
+  temporal-defaultns:
+    image: docker.io/temporalio/admin-tools:1.27
+    depends_on:
+      temporal:
+        condition: service_started
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: ["bash"]
+    command: ["/scripts/create-namespace.sh", "default"]
+    restart: "no"
+
+  # Long-lived CLI sidecar. `make admin` / `make namespace` exec into this — the
+  # distroless server image has no `temporal` CLI or shell.
+  temporal-admin:
+    image: docker.io/temporalio/admin-tools:1.27
+    depends_on:
+      temporal:
+        condition: service_started
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    volumes:
+      - ./scripts:/scripts:ro
+    # No command override — the image's default `tini -- sleep infinity` entrypoint
+    # is exactly what we want for a long-lived CLI sidecar.
     restart: unless-stopped
 
   temporal-ui:
     image: docker.io/temporalio/ui:latest
     depends_on:
-      - temporal
+      temporal:
+        condition: service_started
     environment:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_CORS_ORIGINS: http://localhost:3000
-      # mTLS client certs removed for local dev — UI connects to plaintext server
-    volumes:
-      - ./certs:/etc/temporal/certs:ro
     ports:
       - "8080:8080"
     restart: unless-stopped

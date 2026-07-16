@@ -2,7 +2,7 @@
 
 Shared Temporal infrastructure and Python client library, structured for drop-in to a monorepo.
 
-Temporal is treated as a **platform primitive** — owned and operated centrally, used by all services. Each service connects with its own namespace and mTLS identity. See `DESIGN.md` for the full platform vision.
+Temporal is treated as a **platform primitive** — owned and operated centrally, used by all services. Each service connects with its own namespace and mTLS identity. See `DESIGN.md` for the full platform vision, and `infra/temporal/AUTHZ.md` for the authorization/RBAC design (custom ClaimMapper for per-namespace access).
 
 ---
 
