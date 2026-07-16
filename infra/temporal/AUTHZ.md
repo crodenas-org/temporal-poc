@@ -407,3 +407,49 @@ written by `scripts/entra-app-setup.sh`.
 3. `make entra-assign ROLES="default:read"` → confirm `default` loads and
    `svc-demo` is denied via direct URLs. That closes the Phase 3 negative test.
 4. Then: Phase 2 (service cert path + local mTLS), and the Phase 1 GHA→ECR pipeline.
+
+---
+
+## 15. Feasibility re-assessment & decision point (2026-07-16)
+
+**Read this before continuing to build.** The Phase 2/3 bring-up validated that
+Option B is *technically feasible* — every hard unknown is solved (custom image,
+claim mapper, authorizer wiring, internal-frontend, full Entra integration). What
+remains (Phase 2 cert path, GHA pipeline, ECS) is mechanical and lower-risk than
+what's already done. **Feasibility is not the open question.**
+
+**What the bring-up changed is the *value* calculus, via learning §14#6:** the OSS
+Web UI needs system-level APIs to render, so it **cannot give a namespace-scoped
+human a working scoped view** — a `default:read` user 500s on the landing page.
+Scoped UI for devs was the *primary reason to choose B over the simpler Option A*.
+Server-side enforcement is real (a service/worker with `default:read` genuinely
+cannot touch another namespace), but the marquee human-UI benefit hits an OSS
+ceiling we can't code around.
+
+### The decision is now driver-dependent
+
+| If the real driver is… | Then… |
+|---|---|
+| **Service/worker namespace isolation (gRPC)** | Largely already delivered by per-namespace **mTLS** (pre-existing). B is cheap hardening on top — finish it. |
+| **Scoped UI for devs** | OSS UI won't deliver it. Either (a) give UI users `system:read` and accept a coarse operator-style UI (≈ Option A, far less work), or (b) **Temporal Cloud** — managed RBAC + a UI that scopes per-namespace, no custom image, no internal-frontend, no upgrade treadmill. |
+
+### Two questions to answer next session
+
+1. **What forces self-hosting** vs. Temporal Cloud — a hard constraint (workflow
+   payloads can't leave the VPC, cost, no-SaaS policy) or inertia?
+2. **Was scoped dev UI the real requirement, or is service isolation the thing
+   that matters?**
+
+### Working recommendation (to challenge tomorrow)
+
+- If self-hosting is **inertia** and scoped UI **is** the requirement → seriously
+  price **Temporal Cloud** now. The POC has paid the tuition to know exactly what
+  you'd be buying out of.
+- If self-hosting is **forced** → push on, but adopt the **pragmatic model**: real
+  gRPC enforcement (mTLS + optional JWT) for services, plus a **coarser operator
+  UI** (UI-access users get `system:read`); don't fight the OSS UI for per-dev
+  scoping.
+
+**The POC succeeded regardless** — it answered the cost/ceiling question that a
+slide deck never could. Current code (branch `phase-2-auth`) stands as a working
+reference for the self-host path if that's the call.
