@@ -314,11 +314,14 @@ an operator can act cross-namespace — are the use cases in §1/§8, not phases
 
 ## 13. Open questions / risks
 
-- **Access-token roles claim (§6):** must confirm Entra emits app roles in the
-  access token forwarded by `ui-server`, with correct audience. Validate before
-  committing to the rest.
+- **~~Access-token roles claim (§6)~~ — RESOLVED (2026-07-16):** Entra emits app
+  roles in the **ID token**; `ui-server` forwards it via the `Authorization-Extras`
+  header; the frontend validates it against the tenant JWKS and the default JWT
+  mapper reads the `roles` claim. No audience gotcha. Validated locally end to end.
 - **System-role granularity:** is a single `system:admin` enough, or do we need
-  a read-only cross-namespace operator role? Likely yes for on-call viewers.
+  a read-only cross-namespace operator role? **Yes — see §14 learning #6:** the
+  OSS UI needs system-level APIs to render, so scoped users need at least
+  `system:read` to use the namespace switcher.
 - **Config templating:** keep `dockerize`-style env rendering from auto-setup, or
   move to a committed static config? Leaning committed config for prod
   reproducibility.
@@ -326,3 +329,81 @@ an operator can act cross-namespace — are the use cases in §1/§8, not phases
   is now a build+test+migrate PR? Define a support policy (e.g. N-1).
 - **Cert SAN format:** SPIFFE URI vs CN — decide once; it's baked into
   `namespaceFromSAN` and the cert-issuing scripts.
+
+---
+
+## 14. Local auth bring-up — status & hard-won learnings
+
+**Status (2026-07-16), branch `phase-2-auth`:** the human path (Entra OIDC → UI)
+is validated end to end — login works, JWT is validated against the tenant JWKS,
+and enforcement is **real** (the server injects the default authorizer only when
+`TEMPORAL_AUTH_JWKS_URI` is set). Still to finish: the final UI scoping demo
+(`default:read` sees `default`, is denied `svc-demo`) was interrupted by a
+`ui-server` OIDC init flake (#8 below); re-confirm after a clean bring-up.
+
+### Local workflow
+
+| Command | Effect |
+|---|---|
+| `make up` | Plaintext, **auth OFF** (Phase 1 behavior; workers connect freely) |
+| `make auth-on` | Recreate server + UI with Entra enforcement (reads `.env`) |
+| `make auth-off` | Back to plaintext |
+| `make entra-app` | Create/refresh the single shared app registration (needs `az login`) |
+| `make entra-assign ROLES="default:read"` | Set your app roles (for testing scope) |
+
+`.env` (gitignored) holds `TEMPORAL_AUTH_TENANT_ID/CLIENT_ID/CLIENT_SECRET`,
+written by `scripts/entra-app-setup.sh`.
+
+### Gotchas we hit (all real, all fixed)
+
+1. **`config.Load` signature (1.27):** `config.Load(env, configDir, zone, &cfg)
+   error` — not the functional-options form. Config lives at `<configDir>/<env>.yaml`.
+2. **`Claims` has no `AuthType` field in 1.27** (added later upstream).
+3. **admin-tools ENTRYPOINT is `tini -- sleep infinity`.** Any `command:` is
+   appended as args to `sleep` and ignored; override `entrypoint: ["bash"]` to run
+   the schema/namespace scripts.
+4. **The library `NewServer` path does NOT build the authorizer from config.**
+   `authorization.authorizer: "default"` in YAML is insufficient — without an
+   explicit `temporal.WithAuthorizer(authorization.NewDefaultAuthorizer())` the
+   authorizer is **noop (allow-all)**. Most dangerous gotcha here: the positive
+   test (admin sees everything) is indistinguishable from no enforcement. **Only a
+   negative test (a scoped user denied) proves it.** This is why we test scoping.
+5. **Enabling the authorizer requires `internal-frontend`.** Temporal's own system
+   workers connect with no credentials; once the authorizer is on they're rejected
+   (`Request unauthorized`) and the server exits(1). Fix: run the `internal-frontend`
+   service (port 7236, bypasses auth) **and omit `publicClient` entirely**.
+   Production-correct, not a local hack. Requires adding `internal-frontend` to
+   `ForServices` in `main.go`.
+6. **The OSS UI needs system-level APIs to render.** The landing page calls
+   `ListNamespaces`/`GetSystemInfo` (system-scoped). A purely namespace-scoped user
+   (`default:read`, no `system` role) gets **500s on the landing page** and must
+   navigate directly to `/namespaces/<ns>/workflows`. Implication: scoped humans
+   can't cleanly browse "just their namespace" in the OSS UI — they need a
+   `system:read` role (which grants cross-namespace *read*) for the switcher, or
+   they deep-link. Real constraint of self-hosting the OSS UI; tempers the §1
+   "devs see only their namespace in the UI" goal.
+7. **Entra token mechanics (validated):** app roles are in the **ID token**;
+   `ui-server` forwards it via `Authorization-Extras`; frontend validates vs the
+   tenant JWKS; default JWT mapper reads `roles` (`permissionsClaimName: roles`).
+   App-role *values* are Temporal-native `namespace:role`, so no custom JWT parsing.
+8. **`ui-server` OIDC discovery is one-shot at startup.** If it can't fetch the
+   tenant's `.well-known/openid-configuration` at boot, `/api/v1/settings` returns
+   `Auth.Options: null` and sign-in bounces with no MS prompt. Fix: `podman restart
+   temporal-dev_temporal-ui_1`. Watch for it after `make auth-on` recreates the UI.
+9. **podman-compose + one-shot containers:** re-running `make up` over a live stack
+   can exit 125 on the already-exited `temporal-schema`/`temporal-defaultns`. Use
+   `make reset && make up` for a clean bring-up. (`service_completed_successfully`
+   ordering *is* honored.)
+10. **Namespace creation needs auth off (or admin creds).** With auth on the
+    admin-tools sidecar has no token, so `make namespace` fails. Create namespaces
+    with auth off, then flip on.
+
+### Where to resume
+
+1. `make reset && make up` (clean), then `make auth-on`; if the UI login loops,
+   `podman restart temporal-dev_temporal-ui_1` and re-check
+   `curl -s localhost:8080/api/v1/settings` for non-null `Auth.Options`.
+2. `make entra-assign ROLES="system:admin"` → confirm full UI works.
+3. `make entra-assign ROLES="default:read"` → confirm `default` loads and
+   `svc-demo` is denied via direct URLs. That closes the Phase 3 negative test.
+4. Then: Phase 2 (service cert path + local mTLS), and the Phase 1 GHA→ECR pipeline.

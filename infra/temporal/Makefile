@@ -14,7 +14,7 @@ T_ENV       = TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV)
 
 .PHONY: help up down reset logs ps ui \
         build rebuild namespace admin \
-        entra-app auth-on auth-off \
+        entra-app entra-assign auth-on auth-off \
         certs issue-cert \
         dns-svc compute-svc waas-worker waas-api \
         create-request approve status
@@ -59,6 +59,9 @@ admin: ## Open a shell in the admin-tools sidecar (temporal CLI lives here)
 ## Auth (Entra) — see AUTHZ.md §6
 entra-app: ## Create/refresh the shared Entra app registration (needs: az login)
 	bash scripts/entra-app-setup.sh
+
+entra-assign: ## Set your Entra roles (make entra-assign ROLES="default:read"); empty = none
+	bash scripts/entra-assign-role.sh $(ROLES)
 
 auth-on: ## Recreate server+UI with Entra JWT enforcement ON (reads .env)
 	@grep -q '^TEMPORAL_AUTH_CLIENT_ID=' .env 2>/dev/null || (echo "Run 'make entra-app' first (writes .env)"; exit 1)

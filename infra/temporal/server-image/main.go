@@ -38,33 +38,44 @@ func main() {
 
 	// Env-driven authorization toggle (keeps tenant/JWKS out of the committed
 	// config; auth stays OFF unless TEMPORAL_AUTH_JWKS_URI is set). When set:
-	// humans present Entra JWTs (default JWT mapper reads the `roles` claim), the
-	// default Authorizer enforces per-namespace, and our dualClaimMapper's JWT
-	// delegate activates because KeySourceURIs becomes non-empty. Services still
-	// use the mTLS cert path. See AUTHZ.md §6.
-	if jwks := os.Getenv("TEMPORAL_AUTH_JWKS_URI"); jwks != "" {
+	// humans present Entra JWTs (default JWT mapper reads the `roles` claim) and
+	// our dualClaimMapper's JWT delegate activates because KeySourceURIs becomes
+	// non-empty. Services still use the mTLS cert path. See AUTHZ.md §6.
+	authEnabled := os.Getenv("TEMPORAL_AUTH_JWKS_URI") != ""
+	if authEnabled {
 		a := &cfg.Global.Authorization
-		a.JWTKeyProvider.KeySourceURIs = []string{jwks}
+		a.JWTKeyProvider.KeySourceURIs = []string{os.Getenv("TEMPORAL_AUTH_JWKS_URI")}
 		a.JWTKeyProvider.RefreshInterval = time.Minute
 		a.PermissionsClaimName = "roles"
-		a.Authorizer = "default"
-		a.ClaimMapper = "default" // overridden by WithClaimMapper; set for clarity
 		logger.Info("authorization ENABLED via TEMPORAL_AUTH_JWKS_URI")
 	}
 
-	s, err := temporal.NewServer(
-		temporal.ForServices(temporal.DefaultServices),
+	// Run internal-frontend alongside the default services so Temporal's own
+	// system workers have a non-authorized path to the frontend. Without it,
+	// enabling the authorizer rejects internal workers ("Request unauthorized")
+	// and the server exits. Paired with publicClient being omitted in docker.yaml.
+	svcs := temporal.DefaultServices
+	svcs = append(svcs[:len(svcs):len(svcs)], "internal-frontend")
+
+	opts := []temporal.ServerOption{
+		temporal.ForServices(svcs),
 		temporal.WithConfig(&cfg),
 		temporal.InterruptOn(temporal.InterruptCh()),
-		// Custom claim mapper is compiled in but only invoked when the config's
-		// global.authorization block enables a claimMapper. Phase 1 ships with
-		// authorization disabled, so this is inert until Phase 2/3 turn it on —
-		// which means the custom image is behavior-identical to auto-setup today.
+		// Compiled-in dual mapper. With no authorizer (auth off) its result is
+		// ignored, so plaintext dev keeps working (proven in Phase 1).
 		temporal.WithClaimMapper(func(cfg *config.Config) authorization.ClaimMapper {
 			return newDualClaimMapper(cfg, logger)
 		}),
-		// Authorizer intentionally left as Temporal's default.
-	)
+	}
+	if authEnabled {
+		// The library NewServer path does NOT build the authorizer from config —
+		// without an explicit authorizer it stays noop (allow-all) even with the
+		// JWT config above. Inject the default authorizer so claims are actually
+		// enforced. Omitted when auth is off, so plaintext dev allows everything.
+		opts = append(opts, temporal.WithAuthorizer(authorization.NewDefaultAuthorizer()))
+	}
+
+	s, err := temporal.NewServer(opts...)
 	if err != nil {
 		log.Fatalf("create server: %v", err)
 	}
