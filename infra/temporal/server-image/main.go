@@ -16,7 +16,8 @@ import (
 // Everything else — services, config, storage — is stock Temporal.
 //
 // Bootstrap follows the official sample:
-//   https://github.com/temporalio/samples-server/blob/main/extensibility/authorizer/server/main.go
+//
+//	https://github.com/temporalio/samples-server/blob/main/extensibility/authorizer/server/main.go
 //
 // The config-load and logger lines are the version-sensitive surface: names here
 // track go.temporal.io/server, so reconcile with `go build` against the pinned
@@ -70,9 +71,22 @@ func main() {
 	if authEnabled {
 		// The library NewServer path does NOT build the authorizer from config —
 		// without an explicit authorizer it stays noop (allow-all) even with the
-		// JWT config above. Inject the default authorizer so claims are actually
-		// enforced. Omitted when auth is off, so plaintext dev allows everything.
-		opts = append(opts, temporal.WithAuthorizer(authorization.NewDefaultAuthorizer()))
+		// JWT config above. Inject one so claims are actually enforced. Omitted
+		// when auth is off, so plaintext dev allows everything.
+		//
+		// The default authorizer does all the real work; our wrapper only widens
+		// the handful of cluster-scoped APIs the OSS UI needs to render for a
+		// namespace-scoped human (see authorizer.go / AUTHZ.md §15).
+		opts = append(opts, temporal.WithAuthorizer(
+			newUIRenderAuthorizer(authorization.NewDefaultAuthorizer()),
+		))
+		// ...and because that allows ListNamespaces, trim its response to the
+		// caller's own namespaces. Without this the switcher advertises namespaces
+		// the user can't open, and the stock UI turns the resulting 403 into a
+		// login loop (interceptor.go / AUTHZ.md §14 #14).
+		opts = append(opts, temporal.WithChainedFrontendGrpcInterceptors(
+			newNamespaceFilterInterceptor(),
+		))
 	}
 
 	s, err := temporal.NewServer(opts...)
