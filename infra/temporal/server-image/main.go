@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"time"
 
 	"go.temporal.io/server/common/authorization"
 	"go.temporal.io/server/common/config"
@@ -34,6 +35,22 @@ func main() {
 	}
 
 	logger := commonlog.NewZapLogger(commonlog.BuildZapLogger(cfg.Log))
+
+	// Env-driven authorization toggle (keeps tenant/JWKS out of the committed
+	// config; auth stays OFF unless TEMPORAL_AUTH_JWKS_URI is set). When set:
+	// humans present Entra JWTs (default JWT mapper reads the `roles` claim), the
+	// default Authorizer enforces per-namespace, and our dualClaimMapper's JWT
+	// delegate activates because KeySourceURIs becomes non-empty. Services still
+	// use the mTLS cert path. See AUTHZ.md §6.
+	if jwks := os.Getenv("TEMPORAL_AUTH_JWKS_URI"); jwks != "" {
+		a := &cfg.Global.Authorization
+		a.JWTKeyProvider.KeySourceURIs = []string{jwks}
+		a.JWTKeyProvider.RefreshInterval = time.Minute
+		a.PermissionsClaimName = "roles"
+		a.Authorizer = "default"
+		a.ClaimMapper = "default" // overridden by WithClaimMapper; set for clarity
+		logger.Info("authorization ENABLED via TEMPORAL_AUTH_JWKS_URI")
+	}
 
 	s, err := temporal.NewServer(
 		temporal.ForServices(temporal.DefaultServices),

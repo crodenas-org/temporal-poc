@@ -14,6 +14,7 @@ T_ENV       = TEMPORAL_HOST=$(T_HOST) TEMPORAL_NAMESPACE=$(T_NS) $(T_TLS_ENV)
 
 .PHONY: help up down reset logs ps ui \
         build rebuild namespace admin \
+        entra-app auth-on auth-off \
         certs issue-cert \
         dns-svc compute-svc waas-worker waas-api \
         create-request approve status
@@ -54,6 +55,22 @@ namespace: ## Create a namespace via the admin sidecar  (make namespace NS=svc-n
 
 admin: ## Open a shell in the admin-tools sidecar (temporal CLI lives here)
 	$(COMPOSE) exec temporal-admin bash
+
+## Auth (Entra) — see AUTHZ.md §6
+entra-app: ## Create/refresh the shared Entra app registration (needs: az login)
+	bash scripts/entra-app-setup.sh
+
+auth-on: ## Recreate server+UI with Entra JWT enforcement ON (reads .env)
+	@grep -q '^TEMPORAL_AUTH_CLIENT_ID=' .env 2>/dev/null || (echo "Run 'make entra-app' first (writes .env)"; exit 1)
+	set -a; . ./.env; set +a; \
+	export TEMPORAL_AUTH_ENABLED=true; \
+	export TEMPORAL_AUTH_JWKS_URI="https://login.microsoftonline.com/$$TEMPORAL_AUTH_TENANT_ID/discovery/v2.0/keys"; \
+	$(COMPOSE) up -d --force-recreate temporal temporal-ui
+	@echo ">> Auth ON. Open http://localhost:8080 and sign in with Entra."
+
+auth-off: ## Recreate server+UI plaintext (auth OFF)
+	$(COMPOSE) up -d --force-recreate temporal temporal-ui
+	@echo ">> Auth OFF (plaintext)."
 
 ## Certificates
 certs: ## Generate local dev CA, server cert, and dev-client cert (run once)
