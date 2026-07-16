@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Set the signed-in user's app-role assignments on the temporal-ui app to
 # EXACTLY the roles passed as args (existing assignments for this app are
-# removed first). Used to test RBAC enforcement by downgrading from system:admin
+# removed first). Used to test RBAC enforcement by downgrading from cluster admin
 # to a scoped role and confirming access actually changes.
+#
+# Cluster-wide roles are "temporal-system:*", NOT "system:*" — see AUTHZ.md §14 #11.
 #
 # Usage:
 #   entra-assign-role.sh default:read              # only default:read
 #   entra-assign-role.sh default:read svc-demo:read
+#   entra-assign-role.sh temporal-system:admin     # full cluster admin
 #   entra-assign-role.sh                           # no roles -> no access
 #
 # After running, sign out and back in (or use a fresh incognito window) so a new

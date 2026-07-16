@@ -28,7 +28,20 @@ REDIRECT_URIS=(
 )
 
 # Temporal-native roles. value == "<namespace>:<role>"; role ∈ read|write|admin|worker.
-ROLE_VALUES=("system:admin" "default:read" "default:write" "svc-demo:read")
+#
+# Cluster-scoped roles MUST use the literal namespace "temporal-system" — the
+# default JWT claim mapper compares the namespace part against
+# primitives.SystemLocalNamespace ("temporal-system") to decide whether a
+# permission sets claims.System. A role named "system:admin" does NOT grant
+# cluster scope: it silently maps to namespace "system" (which does not exist),
+# leaving claims.System == 0 and every ScopeCluster API denied. See AUTHZ.md §14.
+ROLE_VALUES=(
+  "temporal-system:admin"   # full cluster admin
+  "temporal-system:read"    # cluster-wide read: lets the OSS UI render its
+                            # namespace list / cluster info (see AUTHZ.md §6)
+  "default:read" "default:write" "svc-demo:read"
+)
+SYSTEM_ADMIN_ROLE="temporal-system:admin"
 
 # Deterministic GUID from a string (stable app-role IDs across re-runs).
 guid() { echo -n "$1" | md5 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/'; }
@@ -75,14 +88,14 @@ if ! az ad sp show --id "$APP_ID" >/dev/null 2>&1; then
   az ad sp create --id "$APP_ID" >/dev/null
 fi
 
-# 4. Assign the signed-in user to system:admin (so you can log in immediately)
+# 4. Assign the signed-in user to cluster admin (so you can log in immediately)
 USER_OID="$(az ad signed-in-user show --query id -o tsv)"
 SP_OID="$(az ad sp show --id "$APP_ID" --query id -o tsv)"
-echo ">> assigning $SIGNED_IN -> system:admin"
+echo ">> assigning $SIGNED_IN -> $SYSTEM_ADMIN_ROLE"
 az rest --method POST \
   --uri "https://graph.microsoft.com/v1.0/users/$USER_OID/appRoleAssignments" \
   --headers "Content-Type=application/json" \
-  --body "{\"principalId\":\"$USER_OID\",\"resourceId\":\"$SP_OID\",\"appRoleId\":\"$(guid system:admin)\"}" \
+  --body "{\"principalId\":\"$USER_OID\",\"resourceId\":\"$SP_OID\",\"appRoleId\":\"$(guid "$SYSTEM_ADMIN_ROLE")\"}" \
   >/dev/null 2>&1 && echo "   assigned" \
   || echo "   (already assigned, or needs admin consent — assign via Portal if UI login later 403s)"
 
