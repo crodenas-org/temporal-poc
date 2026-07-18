@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"time"
 
 	"go.temporal.io/server/common/authorization"
 	"go.temporal.io/server/common/config"
@@ -15,7 +16,8 @@ import (
 // Everything else — services, config, storage — is stock Temporal.
 //
 // Bootstrap follows the official sample:
-//   https://github.com/temporalio/samples-server/blob/main/extensibility/authorizer/server/main.go
+//
+//	https://github.com/temporalio/samples-server/blob/main/extensibility/authorizer/server/main.go
 //
 // The config-load and logger lines are the version-sensitive surface: names here
 // track go.temporal.io/server, so reconcile with `go build` against the pinned
@@ -35,19 +37,59 @@ func main() {
 
 	logger := commonlog.NewZapLogger(commonlog.BuildZapLogger(cfg.Log))
 
-	s, err := temporal.NewServer(
-		temporal.ForServices(temporal.DefaultServices),
+	// Env-driven authorization toggle (keeps tenant/JWKS out of the committed
+	// config; auth stays OFF unless TEMPORAL_AUTH_JWKS_URI is set). When set:
+	// humans present Entra JWTs (default JWT mapper reads the `roles` claim) and
+	// our dualClaimMapper's JWT delegate activates because KeySourceURIs becomes
+	// non-empty. Services still use the mTLS cert path. See AUTHZ.md §6.
+	authEnabled := os.Getenv("TEMPORAL_AUTH_JWKS_URI") != ""
+	if authEnabled {
+		a := &cfg.Global.Authorization
+		a.JWTKeyProvider.KeySourceURIs = []string{os.Getenv("TEMPORAL_AUTH_JWKS_URI")}
+		a.JWTKeyProvider.RefreshInterval = time.Minute
+		a.PermissionsClaimName = "roles"
+		logger.Info("authorization ENABLED via TEMPORAL_AUTH_JWKS_URI")
+	}
+
+	// Run internal-frontend alongside the default services so Temporal's own
+	// system workers have a non-authorized path to the frontend. Without it,
+	// enabling the authorizer rejects internal workers ("Request unauthorized")
+	// and the server exits. Paired with publicClient being omitted in docker.yaml.
+	svcs := temporal.DefaultServices
+	svcs = append(svcs[:len(svcs):len(svcs)], "internal-frontend")
+
+	opts := []temporal.ServerOption{
+		temporal.ForServices(svcs),
 		temporal.WithConfig(&cfg),
 		temporal.InterruptOn(temporal.InterruptCh()),
-		// Custom claim mapper is compiled in but only invoked when the config's
-		// global.authorization block enables a claimMapper. Phase 1 ships with
-		// authorization disabled, so this is inert until Phase 2/3 turn it on —
-		// which means the custom image is behavior-identical to auto-setup today.
+		// Compiled-in dual mapper. With no authorizer (auth off) its result is
+		// ignored, so plaintext dev keeps working (proven in Phase 1).
 		temporal.WithClaimMapper(func(cfg *config.Config) authorization.ClaimMapper {
 			return newDualClaimMapper(cfg, logger)
 		}),
-		// Authorizer intentionally left as Temporal's default.
-	)
+	}
+	if authEnabled {
+		// The library NewServer path does NOT build the authorizer from config —
+		// without an explicit authorizer it stays noop (allow-all) even with the
+		// JWT config above. Inject one so claims are actually enforced. Omitted
+		// when auth is off, so plaintext dev allows everything.
+		//
+		// The default authorizer does all the real work; our wrapper only widens
+		// the handful of cluster-scoped APIs the OSS UI needs to render for a
+		// namespace-scoped human (see authorizer.go / AUTHZ.md §15).
+		opts = append(opts, temporal.WithAuthorizer(
+			newUIRenderAuthorizer(authorization.NewDefaultAuthorizer()),
+		))
+		// ...and because that allows ListNamespaces, trim its response to the
+		// caller's own namespaces. Without this the switcher advertises namespaces
+		// the user can't open, and the stock UI turns the resulting 403 into a
+		// login loop (interceptor.go / AUTHZ.md §14 #14).
+		opts = append(opts, temporal.WithChainedFrontendGrpcInterceptors(
+			newNamespaceFilterInterceptor(),
+		))
+	}
+
+	s, err := temporal.NewServer(opts...)
 	if err != nil {
 		log.Fatalf("create server: %v", err)
 	}

@@ -70,6 +70,14 @@ services:
       grpcPort: 7239
       membershipPort: 6939
       bindOnIP: "0.0.0.0"
+  # Internal-only frontend for Temporal's own system workers. It bypasses the
+  # authorizer, so enabling auth doesn't reject internal traffic ("Request
+  # unauthorized"). Not published to the host — container-internal only.
+  internal-frontend:
+    rpc:
+      grpcPort: 7236
+      membershipPort: 6936
+      bindOnIP: "0.0.0.0"
 
 clusterMetadata:
   enableGlobalNamespace: false
@@ -86,9 +94,8 @@ clusterMetadata:
 dcRedirectionPolicy:
   policy: "noop"
 
-# Internal worker service connects back to the frontend here.
-publicClient:
-  hostPort: "127.0.0.1:7233"
+# publicClient is intentionally omitted: with internal-frontend enabled, internal
+# components use it instead, and Temporal requires publicClient to be absent.
 
 dynamicConfigClient:
   filepath: "/etc/temporal/dynamicconfig/development-sql.yaml"

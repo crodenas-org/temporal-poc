@@ -54,6 +54,14 @@ services:
     environment:
       TEMPORAL_CONFIG_DIR: /etc/temporal/config
       TEMPORAL_ENVIRONMENT: docker
+      # Empty = auth OFF (default). `make auth-on` sets this to the Entra JWKS URI.
+      TEMPORAL_AUTH_JWKS_URI: "${TEMPORAL_AUTH_JWKS_URI:-}"
+      # Audience the UI's ID token must be addressed to. Pins tokens to this app
+      # so another app's token from the same tenant can't be replayed here.
+      TEMPORAL_AUTH_CLIENT_ID: "${TEMPORAL_AUTH_CLIENT_ID:-}"
+      # 1 = log which credential surface each request carries and the claims it
+      # maps to. Authorization denials are otherwise silent. Never logs tokens.
+      TEMPORAL_AUTH_DEBUG: "${TEMPORAL_AUTH_DEBUG:-0}"
     volumes:
       - ./server-image/config:/etc/temporal/config:ro
       - ./dynamicconfig:/etc/temporal/dynamicconfig:ro
@@ -98,6 +106,15 @@ services:
     environment:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_CORS_ORIGINS: http://localhost:3000
+      # Entra OIDC — inert unless TEMPORAL_AUTH_ENABLED=true (set by `make auth-on`).
+      # IDs/secret come from .env (written by scripts/entra-app-setup.sh).
+      TEMPORAL_AUTH_ENABLED: "${TEMPORAL_AUTH_ENABLED:-false}"
+      TEMPORAL_AUTH_TYPE: oidc
+      TEMPORAL_AUTH_PROVIDER_URL: "https://login.microsoftonline.com/${TEMPORAL_AUTH_TENANT_ID:-common}/v2.0"
+      TEMPORAL_AUTH_CLIENT_ID: "${TEMPORAL_AUTH_CLIENT_ID:-}"
+      TEMPORAL_AUTH_CLIENT_SECRET: "${TEMPORAL_AUTH_CLIENT_SECRET:-}"
+      TEMPORAL_AUTH_CALLBACK_URL: "http://localhost:8080/auth/sso/callback"
+      TEMPORAL_AUTH_SCOPES: "openid,profile,email"
     ports:
       - "8080:8080"
     restart: unless-stopped

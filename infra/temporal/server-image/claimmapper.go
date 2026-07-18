@@ -4,6 +4,7 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"go.temporal.io/server/common/authorization"
@@ -17,14 +18,34 @@ import (
 //
 //   - Service workers present an mTLS client certificate (no token). The cert's
 //     identity maps to exactly one namespace with Worker|Writer.
-//   - Humans (UI / CLI) present an Entra bearer JWT. That path delegates to
-//     Temporal's default JWT claim mapper, which validates the signature and
-//     reads namespace roles from the token's `roles` claim (§6).
+//   - Humans (UI / CLI) present an Entra JWT. That path delegates to Temporal's
+//     default JWT claim mapper, which validates the signature and reads namespace
+//     roles from the token's `roles` claim (§6).
 //
-// Phase 1 exercises only the certificate branch; the JWT delegate is nil unless
-// the server config declares a JWT key provider, which happens in Phase 3.
+// # Which token carries the roles
+//
+// The UI sends TWO credentials, and only one of them is usable:
+//
+//	Authorization:        an ACCESS token, aud=00000003-0000-0000-c000-000000000000
+//	                      (Microsoft Graph). No `roles` claim, and signed by a key
+//	                      we cannot verify against our tenant JWKS.
+//	Authorization-Extras: the ID token, aud=<our client id>, carrying `roles`.
+//
+// Temporal's default mapper only ever reads AuthToken (the Authorization header),
+// so on its own it validates the Graph token and fails with
+// "crypto/rsa: verification error" — every request, silently, denying everything.
+// Surfacing the ID token from ExtraData is exactly what Temporal exposes that
+// field for, and it is why this custom mapper exists. See AUTHZ.md §14.
+//
+// The ID token is still fully validated by the delegate (signature vs. the tenant
+// JWKS) and we additionally pin its audience to our own client id, so a token
+// minted for a different app in the same tenant cannot be replayed here.
 type dualClaimMapper struct {
-	jwt authorization.ClaimMapper // human path; nil until JWT is configured
+	jwt    authorization.ClaimMapper // human path; nil until JWT is configured
+	logger log.Logger                // may be nil in tests; only used for TEMPORAL_AUTH_DEBUG
+	// audience, when set, is the client id every human token must be addressed to.
+	// Empty disables the check (the delegate skips audience validation).
+	audience string
 }
 
 // newDualClaimMapper is the factory handed to temporal.WithClaimMapper. It builds
@@ -36,17 +57,37 @@ func newDualClaimMapper(cfg *config.Config, logger log.Logger) authorization.Cla
 		provider := authorization.NewDefaultTokenKeyProvider(&cfg.Global.Authorization, logger)
 		jwt = authorization.NewDefaultJWTClaimMapper(provider, &cfg.Global.Authorization, logger)
 	}
-	return &dualClaimMapper{jwt: jwt}
+	return &dualClaimMapper{
+		jwt:      jwt,
+		logger:   logger,
+		audience: os.Getenv("TEMPORAL_AUTH_CLIENT_ID"),
+	}
 }
 
 func (m *dualClaimMapper) GetClaims(info *authorization.AuthInfo) (*authorization.Claims, error) {
-	// Human path: a bearer token was presented. Delegate to the default JWT
-	// mapper, which owns signature validation and namespace:role parsing.
-	if info.AuthToken != "" {
+	if authDebugEnabled() && m.logger != nil {
+		logAuthInfo(info, m.logger)
+		claims, err := m.getClaims(info)
+		logClaims(claims, err, m.logger)
+		return claims, err
+	}
+	return m.getClaims(info)
+}
+
+func (m *dualClaimMapper) getClaims(info *authorization.AuthInfo) (*authorization.Claims, error) {
+	// Human path. Prefer the ID token from Authorization-Extras: it is the only
+	// one carrying `roles`, and the Authorization header from the UI holds a Graph
+	// access token that would fail verification outright (see the type comment).
+	// The CLI presents its token in Authorization with no extras, so fall back.
+	if token := humanToken(info); token != "" {
 		if m.jwt == nil {
 			return nil, errors.New("bearer token presented but JWT authentication is not configured")
 		}
-		return m.jwt.GetClaims(info)
+		return m.jwt.GetClaims(&authorization.AuthInfo{
+			AuthToken:     token,
+			TLSConnection: info.TLSConnection,
+			Audience:      m.audience,
+		})
 	}
 
 	// Service path: an mTLS client certificate, no token.
@@ -64,6 +105,20 @@ func (m *dualClaimMapper) GetClaims(info *authorization.AuthInfo) (*authorizatio
 	}
 
 	return nil, errors.New("no client certificate or bearer token presented")
+}
+
+// humanToken picks the credential to authorize a human by, normalized to the
+// "Bearer <jwt>" form the default JWT mapper expects. ExtraData wins because the
+// UI puts the role-bearing ID token there; it arrives bare, without the scheme.
+// Returns "" when neither header is present (the service/mTLS path).
+func humanToken(info *authorization.AuthInfo) string {
+	if extra := strings.TrimSpace(info.ExtraData); extra != "" {
+		if !strings.HasPrefix(strings.ToLower(extra), "bearer ") {
+			extra = "Bearer " + extra
+		}
+		return extra
+	}
+	return strings.TrimSpace(info.AuthToken)
 }
 
 // namespaceFromCert derives the single namespace a service certificate may access.
